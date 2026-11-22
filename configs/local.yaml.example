@@ -1,0 +1,16 @@
+# =============================================================================
+# Basira AI — Local overrides  (copy to local.yaml and git-ignore it)
+# =============================================================================
+# This file shows how to override default.yaml for a local Windows/Linux
+# machine where data lives somewhere other than /content/data.
+#
+# Usage (OmegaConf merge):
+#   cfg = OmegaConf.merge(OmegaConf.load("configs/default.yaml"),
+#                         OmegaConf.load("configs/local.yaml"))
+# =============================================================================
+
+env:
+  runtime: local
+
+data:
+  root: D:/retina_data     # change to wherever you put the datasets

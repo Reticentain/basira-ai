@@ -1,0 +1,4 @@
+# app directory
+# ─────────────
+# Offline screening application (progressive web app / Android).
+# Will be built in Phase 4 after the model is compressed and exported to ONNX.

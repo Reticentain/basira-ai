@@ -1,0 +1,5 @@
+# scripts directory
+# ─────────────────
+# Standalone Python scripts for training, evaluation, export, etc.
+# These are run from Colab cells or the command line, not imported as modules.
+# They will be added in Phase 2 and later.

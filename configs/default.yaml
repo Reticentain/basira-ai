@@ -1,0 +1,117 @@
+# =============================================================================
+# Basira AI — Default Configuration
+# =============================================================================
+# All paths and hyperparameters live here. Never hard-code them in source.
+# Override by creating configs/local.yaml (git-ignored) or by setting the
+# environment variable BASIRA_DATA_ROOT.
+#
+# Config is loaded via src/basira/config.py using OmegaConf.
+# =============================================================================
+
+# ── Random seeds (log these in every run) ────────────────────────────────────
+seeds:
+  global_seed: 42       # used for all numpy/torch/random calls
+  split_seed: 42        # GroupShuffleSplit seed — never change after first split
+  bootstrap_seed: 0     # bootstrap CI seed
+
+# ── Data paths ────────────────────────────────────────────────────────────────
+data:
+  # Root path. Set BASIRA_DATA_ROOT env var to override.
+  root: /content/data
+
+  aptos:
+    images: ${data.root}/aptos/train_images   # *.png (~3 662 images)
+    labels_csv: ${data.root}/aptos/train.csv  # columns: id_code, diagnosis (0-4)
+    # NOTE: APTOS provides NO patient IDs. We split by image (each image = one
+    # "patient"). Near-identical images are removed by perceptual hash before splitting.
+    has_patient_ids: false
+
+  eyepacs:
+    # NOTE: directory names contain spaces — keep the quotes.
+    train_images: "${data.root}/eyepacs/resized train 15"   # 35 126 *.jpg
+    test_images:  "${data.root}/eyepacs/resized test 15"    # 53 576 *.jpg
+    train_labels: ${data.root}/eyepacs/labels/trainLabels15.csv  # image, level
+    test_labels:  ${data.root}/eyepacs/labels/testLabels15.csv   # image, level, Usage
+    # Patient ID = text before the first "_" in the filename,
+    # e.g. "1234_left.jpg"  →  patient "1234"
+    patient_id_sep: "_"
+    has_patient_ids: true
+    # Official train and test sets have NO patient overlap — no need to re-check.
+    # We split the official train into train/val by patient (GroupShuffleSplit).
+
+  messidor2:
+    images: ${data.root}/messidor2/images
+    labels_csv: ${data.root}/messidor2/labels.csv   # columns: image, grade
+    role: external_test   # NEVER used for training, val, or threshold tuning
+
+  idrid:
+    images: ${data.root}/idrid/images
+    labels_csv: ${data.root}/idrid/labels.csv       # columns: image, grade, orig_split
+    role: external_test   # NEVER used for training, val, or threshold tuning
+    total_images: 516     # all 516 images used; ignore orig_split column
+
+# ── Splits ────────────────────────────────────────────────────────────────────
+splits:
+  # EyePACS official train → train / val by patient (GroupShuffleSplit)
+  eyepacs_val_fraction: 0.15
+  # APTOS train.csv → train / val / test by image (no patient IDs)
+  aptos_val_fraction: 0.15
+  aptos_test_fraction: 0.15
+
+# ── Image preprocessing ───────────────────────────────────────────────────────
+image:
+  # EDA (notebook 01) must measure and report actual image dimensions per dataset.
+  # 256 is the default; adjust after EDA if needed.
+  size: 256
+  channels: 3
+  # Circular black-border crop applied before resize
+  apply_border_crop: true
+  # CLAHE contrast enhancement
+  apply_clahe: true
+  clahe_clip_limit: 2.0
+  clahe_tile_grid: [8, 8]
+  # ImageNet normalisation (applied after CLAHE, in the dataset __getitem__)
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  # Main model. Use "mobilenetv3_large_100" for the lightweight comparison.
+  backbone: efficientnet_b0
+  pretrained: true              # ImageNet weights via timm
+  num_classes_grade: 5          # grades 0–4 (secondary task)
+  num_classes_referable: 2      # binary: non-referable (0–1) vs referable (≥2)
+  dropout: 0.3
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  batch_size: 32
+  num_workers: 2                # keep low in Colab to avoid DataLoader timeouts
+  epochs: 20
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  use_class_weights: true       # compensate for grade imbalance
+  use_amp: true                 # mixed-precision fp16 on GPU
+  accumulation_steps: 1         # increase if GPU OOM
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+evaluation:
+  target_specificity: 0.90      # sensitivity reported at this fixed specificity
+  bootstrap_n: 1000             # bootstrap resamples for 95% CI
+  # Bootstrap resamples by PATIENT when patient IDs exist (EyePACS),
+  # because both eyes of one person are correlated.
+  calibration_bins: 10
+
+# ── Compression targets (from project report — not measured yet) ──────────────
+compression:
+  target_max_size_mb: 15        # int8 model must fit in ≤15 MB
+  target_max_auc_drop: 0.02     # AUC drop after quantisation must be ≤2 points
+  quantisation: int8
+
+# ── Output paths (Google Drive — survives Colab session resets) ───────────────
+output:
+  drive_root: /content/drive/MyDrive/basira
+  checkpoints: ${output.drive_root}/checkpoints   # one .pt file saved per epoch
+  reports:     ${output.drive_root}/reports       # JSON + CSV + PNG evaluation outputs
+  figures:     ${output.drive_root}/figures       # plots
+  onnx_model:  ${output.drive_root}/checkpoints/basira_b0.onnx

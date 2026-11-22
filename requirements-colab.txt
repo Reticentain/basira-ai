@@ -1,0 +1,16 @@
+# requirements-colab.txt
+# ──────────────────────────────────────────────────────────────────────────────
+# Install in Colab with:
+#   pip install -q -r requirements-colab.txt
+#
+# torch and torchvision are EXCLUDED: Colab already ships them with GPU support.
+# Do NOT add them here — reinstalling would downgrade the Colab-optimised build.
+# ──────────────────────────────────────────────────────────────────────────────
+
+timm>=0.9.12            # EfficientNet-B0 / MobileNetV3 pretrained weights
+grad-cam>=1.4.8         # pytorch-grad-cam: GradCAM overlays
+onnx>=1.15.0            # model export to ONNX
+onnxruntime>=1.16.0     # ONNX inference (CPU; GPU build not needed in Colab)
+omegaconf>=2.3.0        # YAML config with dot-access and merge
+rich>=13.0.0            # pretty console output
+pytest>=7.4.0           # test runner
