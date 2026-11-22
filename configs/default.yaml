@@ -61,8 +61,8 @@ splits:
 # ── Deduplication ─────────────────────────────────────────────────────────────
 dedup:
   # Maximum Hamming distance (out of 256 bits) to consider candidate duplicates.
-  # Set to 8 for the calibration inspection run to cover distances 0..8.
-  max_hamming: 8
+  # Threshold chosen by visual calibration (identical photos at d<=1, different photos at d>=3, no pairs at d=2).
+  max_hamming: 1
 
 # ── Image preprocessing ───────────────────────────────────────────────────────
 image:
