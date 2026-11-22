@@ -22,6 +22,7 @@ import pytest
 import pandas as pd
 
 from basira.config import load_config
+from basira.data.loaders import read_split_csv
 from basira.data.splits import assert_no_patient_leakage
 
 # Search paths for split CSVs: local reports/splits or Drive splits
@@ -65,8 +66,8 @@ class TestRealDatasetSplits:
         ep_val_path = get_split_path("eyepacs_val.csv")
         ep_test_path = get_split_path("eyepacs_test.csv")
 
-        df_train = pd.read_csv(ep_train_path)
-        df_val = pd.read_csv(ep_val_path)
+        df_train = read_split_csv(ep_train_path)
+        df_val = read_split_csv(ep_val_path)
 
         # 1. Train + Val row count must equal 35,126
         train_val_total = len(df_train) + len(df_val)
@@ -76,7 +77,7 @@ class TestRealDatasetSplits:
 
         # 2. Test row count must equal 53,576 (if test split CSV is present)
         if ep_test_path is not None and ep_test_path.exists():
-            df_test = pd.read_csv(ep_test_path)
+            df_test = read_split_csv(ep_test_path)
             assert len(df_test) == 53576, (
                 f"EyePACS test count mismatch: expected 53576, got {len(df_test)}"
             )
@@ -84,34 +85,54 @@ class TestRealDatasetSplits:
     def test_eyepacs_patient_leakage_and_both_eyes_together(self):
         """
         Verify:
-          (a) Zero patient_id leakage across EyePACS train and val.
-          (b) Both eyes of each patient stay in the same split.
+          (a) Zero patient_id leakage across EyePACS train, val, and test.
+          (b) Every patient has all of its images in exactly one split.
         """
-        df_train = pd.read_csv(get_split_path("eyepacs_train.csv"))
-        df_val = pd.read_csv(get_split_path("eyepacs_val.csv"))
+        ep_train_path = get_split_path("eyepacs_train.csv")
+        ep_val_path = get_split_path("eyepacs_val.csv")
+        ep_test_path = get_split_path("eyepacs_test.csv")
 
-        train_patients = set(df_train["patient_id"].astype(str))
-        val_patients = set(df_val["patient_id"].astype(str))
+        df_train = read_split_csv(ep_train_path)
+        df_val = read_split_csv(ep_val_path)
 
-        # (a) No patient in both splits
-        overlap = train_patients.intersection(val_patients)
-        assert len(overlap) == 0, (
-            f"EyePACS patient leakage detected: {len(overlap)} patients found in both train and val: {list(overlap)[:5]}"
-        )
+        splits_df = {"train": df_train, "val": df_val}
+        if ep_test_path is not None and ep_test_path.exists():
+            splits_df["test"] = read_split_csv(ep_test_path)
 
-        # Call the strict assert_no_patient_leakage guard
+        splits_patients = {
+            name: set(df["patient_id"].dropna().tolist())
+            for name, df in splits_df.items()
+        }
+
+        # (a) No patient is in more than one of train/val/test
+        split_names = list(splits_patients.keys())
+        for i in range(len(split_names)):
+            for j in range(i + 1, len(split_names)):
+                s1, s2 = split_names[i], split_names[j]
+                overlap = splits_patients[s1].intersection(splits_patients[s2])
+                assert len(overlap) == 0, (
+                    f"EyePACS patient leakage between '{s1}' and '{s2}': "
+                    f"{len(overlap)} patients overlap: {list(overlap)[:5]}"
+                )
+
         assert_no_patient_leakage({
-            "train": df_train["patient_id"].astype(str).tolist(),
-            "val": df_val["patient_id"].astype(str).tolist(),
+            name: df["patient_id"].dropna().tolist()
+            for name, df in splits_df.items()
         })
 
-        # (b) Both eyes check: within each split, patients with 2 images have both in the same split
-        # Combine and ensure every patient's images all reside in either train or val exclusively
-        for pid, group in pd.concat([df_train, df_val]).groupby("patient_id"):
-            in_train = pid in train_patients
-            in_val = pid in val_patients
-            # Exactly one of in_train or in_val must be True
-            assert in_train != in_val, f"Patient {pid} images split across train and val!"
+        # (b) Every patient has all of its images in exactly one split
+        all_ep = pd.concat(list(splits_df.values()), ignore_index=True)
+        for pid, group in all_ep.groupby("patient_id"):
+            pid_str = str(pid)
+            in_splits = [name for name, p_set in splits_patients.items() if pid_str in p_set]
+            assert len(in_splits) == 1, (
+                f"Patient {pid_str} images appear in multiple splits: {in_splits}"
+            )
+            # Ensure within group, all rows actually belong to that single split
+            unique_sources = set(group["source"])
+            assert len(unique_sources) == 1, (
+                f"Patient {pid_str} images have mixed sources: {unique_sources}"
+            )
 
     def test_aptos_split_sums_to_deduped_total(self):
         """Do not hardcode post-dedup count: test that train + val + test == deduped_total."""
@@ -123,10 +144,10 @@ class TestRealDatasetSplits:
         if any(p is None for p in [apt_train_path, apt_val_path, apt_test_path, apt_dedup_path]):
             pytest.skip("APTOS split CSV files missing.")
 
-        df_train = pd.read_csv(apt_train_path)
-        df_val = pd.read_csv(apt_val_path)
-        df_test = pd.read_csv(apt_test_path)
-        df_dedup = pd.read_csv(apt_dedup_path)
+        df_train = read_split_csv(apt_train_path)
+        df_val = read_split_csv(apt_val_path)
+        df_test = read_split_csv(apt_test_path)
+        df_dedup = read_split_csv(apt_dedup_path)
 
         total_split_rows = len(df_train) + len(df_val) + len(df_test)
         total_dedup_rows = len(df_dedup)
@@ -151,9 +172,9 @@ class TestRealDatasetSplits:
         idrid_path = get_split_path("idrid_test.csv")
 
         if mess_path is not None and mess_path.exists():
-            df_mess = pd.read_csv(mess_path)
+            df_mess = read_split_csv(mess_path)
             assert len(df_mess) == 1744, f"Messidor-2 count expected 1744, got {len(df_mess)}"
 
         if idrid_path is not None and idrid_path.exists():
-            df_idrid = pd.read_csv(idrid_path)
+            df_idrid = read_split_csv(idrid_path)
             assert len(df_idrid) == 516, f"IDRiD count expected 516, got {len(df_idrid)}"

@@ -12,6 +12,7 @@ from basira.data.loaders import (
     load_eyepacs,
     load_idrid,
     load_messidor2,
+    read_split_csv,
     rebuild_path,
 )
 from basira.data.preprocess import (
@@ -35,6 +36,7 @@ __all__ = [
     "load_eyepacs",
     "load_messidor2",
     "load_idrid",
+    "read_split_csv",
     "rebuild_path",
     "UNIFIED_COLUMNS",
     "crop_black_borders",

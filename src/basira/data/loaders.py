@@ -41,6 +41,34 @@ UNIFIED_COLUMNS = [
 ]
 
 
+def read_split_csv(path: str | pathlib.Path) -> pd.DataFrame:
+    """
+    Read a split CSV ensuring string types for identifiers (patient_id, image_id, source, eye).
+
+    Prevents pandas from inferring numeric types for patient_id (e.g. '10' -> 10),
+    which breaks string lookups, set operations, and patient grouping across splits.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Path to the split CSV file.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with guaranteed string types for identifier columns.
+    """
+    return pd.read_csv(
+        path,
+        dtype={
+            "patient_id": str,
+            "image_id": str,
+            "source": str,
+            "eye": str,
+        },
+    )
+
+
 def rebuild_path(source: str, image_id: str, cfg: Optional[DictConfig] = None) -> str:
     """
     Reconstruct the full absolute file path from source and image_id using config.
