@@ -15,10 +15,15 @@ Paths are NOT stored in CSVs; they are rebuilt dynamically at runtime using `reb
 Outputs are saved to:
   1. cfg.output.splits (Google Drive: /content/drive/MyDrive/basira/splits/)
   2. reports/splits/ (mirrored locally for git tracking)
+
+CLI Options:
+  --dry-run : Run deduplication, distance profiling, and calibration figure generation
+              WITHOUT writing any split CSV files.
 """
 
 from __future__ import annotations
 
+import argparse
 import pathlib
 import sys
 
@@ -38,9 +43,19 @@ from basira.data.splits import assert_no_patient_leakage, patient_split, stratif
 SPLIT_COLUMNS = ["source", "image_id", "grade", "referable", "patient_id", "eye"]
 
 
-def save_split_csv(df: pd.DataFrame, filename: str, drive_dir: pathlib.Path, local_dir: pathlib.Path) -> None:
-    """Save clean split DataFrame to both Drive and local reports/splits."""
+def save_split_csv(
+    df: pd.DataFrame,
+    filename: str,
+    drive_dir: pathlib.Path,
+    local_dir: pathlib.Path,
+    dry_run: bool = False,
+) -> None:
+    """Save clean split DataFrame to both Drive and local reports/splits (unless dry_run)."""
     clean_df = df[SPLIT_COLUMNS].copy()
+
+    if dry_run:
+        print(f"  [DRY RUN] {filename:<25} ({len(clean_df):>6} rows) - skipped saving.")
+        return
 
     # Save to Drive
     drive_dir.mkdir(parents=True, exist_ok=True)
@@ -53,7 +68,7 @@ def save_split_csv(df: pd.DataFrame, filename: str, drive_dir: pathlib.Path, loc
     print(f"  [SAVED] {filename:<25} ({len(clean_df):>6} rows)")
 
 
-def create_all_splits(cfg: DictConfig | None = None) -> None:
+def create_all_splits(cfg: DictConfig | None = None, dry_run: bool = False) -> None:
     """Run full splitting workflow using configurations and fixed seeds."""
     if cfg is None:
         cfg = load_config()
@@ -64,7 +79,10 @@ def create_all_splits(cfg: DictConfig | None = None) -> None:
 
     print("=" * 70)
     print("BASIRA AI — Generating Dataset Splits")
+    if dry_run:
+        print(">>> MODE: DRY-RUN (Deduplication runs, NO split CSV files will be written) <<<")
     print(f"Random seed: {seed}")
+    print(f"Active dedup threshold (cfg.dedup.max_hamming): {cfg.dedup.max_hamming}")
     print(f"Drive destination: {drive_splits_dir}")
     print(f"Local destination: {local_splits_dir}")
     print("=" * 70)
@@ -95,9 +113,9 @@ def create_all_splits(cfg: DictConfig | None = None) -> None:
         "val": ep_val["patient_id"].tolist(),
     })
 
-    save_split_csv(ep_train, "eyepacs_train.csv", drive_splits_dir, local_splits_dir)
-    save_split_csv(ep_val, "eyepacs_val.csv", drive_splits_dir, local_splits_dir)
-    save_split_csv(df_ep_test_raw, "eyepacs_test.csv", drive_splits_dir, local_splits_dir)
+    save_split_csv(ep_train, "eyepacs_train.csv", drive_splits_dir, local_splits_dir, dry_run=dry_run)
+    save_split_csv(ep_val, "eyepacs_val.csv", drive_splits_dir, local_splits_dir, dry_run=dry_run)
+    save_split_csv(df_ep_test_raw, "eyepacs_test.csv", drive_splits_dir, local_splits_dir, dry_run=dry_run)
 
     # ─────────────────────────────────────────────────────────────────────────
     # 2. APTOS Splits (with Deduplication)
@@ -106,11 +124,11 @@ def create_all_splits(cfg: DictConfig | None = None) -> None:
     df_aptos_raw = load_aptos(cfg)
     print(f"  APTOS raw loaded: {len(df_aptos_raw)} images")
 
-    # Deduplicate APTOS using 256-bit dHash
+    # Deduplicate APTOS using 256-bit dHash with caching and distance profiling
     df_aptos_dedup, dedup_summary = deduplicate_aptos(df_aptos_raw, cfg=cfg)
 
     # Save full deduplicated set (external test benchmark for EyePACS models)
-    save_split_csv(df_aptos_dedup, "aptos_deduped.csv", drive_splits_dir, local_splits_dir)
+    save_split_csv(df_aptos_dedup, "aptos_deduped.csv", drive_splits_dir, local_splits_dir, dry_run=dry_run)
 
     # Split 70% train / 15% val / 15% test using stratified_image_split
     aptos_val_frac = float(cfg.splits.aptos_val_fraction)
@@ -125,28 +143,39 @@ def create_all_splits(cfg: DictConfig | None = None) -> None:
         id_col="image_id",
     )
 
-    save_split_csv(apt_train, "aptos_train.csv", drive_splits_dir, local_splits_dir)
-    save_split_csv(apt_val, "aptos_val.csv", drive_splits_dir, local_splits_dir)
-    save_split_csv(apt_test, "aptos_test.csv", drive_splits_dir, local_splits_dir)
+    save_split_csv(apt_train, "aptos_train.csv", drive_splits_dir, local_splits_dir, dry_run=dry_run)
+    save_split_csv(apt_val, "aptos_val.csv", drive_splits_dir, local_splits_dir, dry_run=dry_run)
+    save_split_csv(apt_test, "aptos_test.csv", drive_splits_dir, local_splits_dir, dry_run=dry_run)
 
     # ─────────────────────────────────────────────────────────────────────────
     # 3. Messidor-2 (External Test Only)
     # ─────────────────────────────────────────────────────────────────────────
     print("\n[3/4] Processing Messidor-2...")
     df_messidor = load_messidor2(cfg)
-    save_split_csv(df_messidor, "messidor2_test.csv", drive_splits_dir, local_splits_dir)
+    save_split_csv(df_messidor, "messidor2_test.csv", drive_splits_dir, local_splits_dir, dry_run=dry_run)
 
     # ─────────────────────────────────────────────────────────────────────────
     # 4. IDRiD (External Test Only)
     # ─────────────────────────────────────────────────────────────────────────
     print("\n[4/4] Processing IDRiD...")
     df_idrid = load_idrid(cfg)
-    save_split_csv(df_idrid, "idrid_test.csv", drive_splits_dir, local_splits_dir)
+    save_split_csv(df_idrid, "idrid_test.csv", drive_splits_dir, local_splits_dir, dry_run=dry_run)
 
     print("\n" + "=" * 70)
-    print("All splits generated and validated successfully.")
+    if dry_run:
+        print("[DRY RUN COMPLETE] Deduplication, hash caching, and calibration figure finished.")
+        print("                   No split CSV files were written to disk.")
+    else:
+        print("All splits generated and validated successfully.")
     print("=" * 70)
 
 
 if __name__ == "__main__":
-    create_all_splits()
+    parser = argparse.ArgumentParser(description="Generate dataset splits for Basira AI.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run deduplication and distance analysis without saving split CSVs.",
+    )
+    args = parser.parse_args()
+    create_all_splits(dry_run=args.dry_run)

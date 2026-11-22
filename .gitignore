@@ -12,6 +12,7 @@
 *.onnx
 *.tflite
 *.pkl
+*.npy
 checkpoints/
 
 # ── Kaggle / API tokens (NEVER commit) ────────────────────────────────────────

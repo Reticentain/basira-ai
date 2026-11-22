@@ -58,6 +58,12 @@ splits:
   aptos_val_fraction: 0.15
   aptos_test_fraction: 0.15
 
+# ── Deduplication ─────────────────────────────────────────────────────────────
+dedup:
+  # Maximum Hamming distance (out of 256 bits) to consider candidate duplicates.
+  # Set to 8 for the calibration inspection run to cover distances 0..8.
+  max_hamming: 8
+
 # ── Image preprocessing ───────────────────────────────────────────────────────
 image:
   # EDA (notebook 01) must measure and report actual image dimensions per dataset.
