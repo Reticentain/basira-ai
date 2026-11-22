@@ -1,1 +1,52 @@
-# basira.data sub-package
+"""
+basira.data
+===========
+Data loading, preprocessing, deduplication, and patient-level splitting.
+"""
+
+from basira.data.dedup import compute_dhash_256, deduplicate_aptos
+from basira.data.loaders import (
+    UNIFIED_COLUMNS,
+    load_aptos,
+    load_dataset,
+    load_eyepacs,
+    load_idrid,
+    load_messidor2,
+    rebuild_path,
+)
+from basira.data.preprocess import (
+    crop_and_enhance,
+    crop_black_borders,
+    pad_to_square,
+    preprocess_image,
+    to_tensor_and_normalize,
+)
+from basira.data.splits import (
+    aptos_patient_id,
+    assert_no_patient_leakage,
+    eyepacs_patient_id,
+    patient_split,
+    stratified_image_split,
+)
+
+__all__ = [
+    "load_dataset",
+    "load_aptos",
+    "load_eyepacs",
+    "load_messidor2",
+    "load_idrid",
+    "rebuild_path",
+    "UNIFIED_COLUMNS",
+    "crop_black_borders",
+    "pad_to_square",
+    "crop_and_enhance",
+    "to_tensor_and_normalize",
+    "preprocess_image",
+    "compute_dhash_256",
+    "deduplicate_aptos",
+    "patient_split",
+    "stratified_image_split",
+    "assert_no_patient_leakage",
+    "eyepacs_patient_id",
+    "aptos_patient_id",
+]

@@ -2,6 +2,8 @@
 /data/*
 !/data/README.md
 *.csv
+!reports/splits/*.csv
+!reports/splits/
 *.xlsx
 
 # ── Model weights & exports ───────────────────────────────────────────────────
@@ -20,7 +22,10 @@ checkpoints/
 
 # ── Reports: generated outputs only (keep .md/.gitkeep stubs) ─────────────────
 reports/*.json
+!reports/eda_summary.json
 reports/*.csv
+!reports/splits/*.csv
+!reports/splits/
 reports/*.png
 reports/*.html
 
