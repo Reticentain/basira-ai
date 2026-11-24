@@ -4,6 +4,12 @@ basira.data
 Data loading, preprocessing, deduplication, and patient-level splitting.
 """
 
+from basira.data.cache import (
+    cache_dir,
+    cache_path,
+    compute_cache_tag,
+    validate_cache_manifest,
+)
 from basira.data.dedup import compute_dhash_256, deduplicate_aptos
 from basira.data.loaders import (
     UNIFIED_COLUMNS,
@@ -16,6 +22,7 @@ from basira.data.loaders import (
     rebuild_path,
 )
 from basira.data.preprocess import (
+    PREPROCESS_VERSION,
     crop_and_enhance,
     crop_black_borders,
     pad_to_square,
@@ -39,6 +46,7 @@ __all__ = [
     "read_split_csv",
     "rebuild_path",
     "UNIFIED_COLUMNS",
+    "PREPROCESS_VERSION",
     "crop_black_borders",
     "pad_to_square",
     "crop_and_enhance",
@@ -51,4 +59,8 @@ __all__ = [
     "assert_no_patient_leakage",
     "eyepacs_patient_id",
     "aptos_patient_id",
+    "cache_dir",
+    "cache_path",
+    "compute_cache_tag",
+    "validate_cache_manifest",
 ]

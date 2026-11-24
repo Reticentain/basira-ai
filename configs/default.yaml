@@ -116,9 +116,12 @@ compression:
 
 # ── Output paths (Google Drive — survives Colab session resets) ───────────────
 output:
-  drive_root: /content/drive/MyDrive/basira
+  drive_root:  /content/drive/MyDrive/basira
   checkpoints: ${output.drive_root}/checkpoints   # one .pt file saved per epoch
   reports:     ${output.drive_root}/reports       # JSON + CSV + PNG evaluation outputs
   splits:      ${output.drive_root}/splits        # train/val/test CSV splits
   figures:     ${output.drive_root}/figures       # plots
   onnx_model:  ${output.drive_root}/checkpoints/basira_b0.onnx
+  # Stage-1 preprocessing cache (keyed by preprocess tag; rebuilt when tag changes)
+  cache_root:  /content/cache
+  cache_drive: ${output.drive_root}/cache         # Drive zips of each source

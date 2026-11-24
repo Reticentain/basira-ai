@@ -26,6 +26,12 @@ import numpy as np
 import torch
 from PIL import Image
 
+# ---------------------------------------------------------------------------
+# Version sentinel — bump this integer whenever Stage 1 logic changes so that
+# cache_tag() produces a new tag and old cached files are never silently reused.
+# ---------------------------------------------------------------------------
+PREPROCESS_VERSION: int = 2
+
 
 def crop_black_borders(
     img: np.ndarray,
