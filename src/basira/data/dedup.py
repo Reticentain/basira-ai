@@ -58,7 +58,7 @@ def compute_dhash_256(img: Image.Image | np.ndarray, hash_size: int = 16) -> np.
         img_np = img
 
     # 1. Border crop and square pad before hashing
-    cropped = crop_black_borders(img_np)
+    cropped, _mask = crop_black_borders(img_np)
     squared = pad_to_square(cropped)
 
     # 2. Convert to grayscale via standard luminance weights

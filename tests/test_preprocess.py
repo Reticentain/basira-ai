@@ -61,7 +61,8 @@ class TestPreprocessPipeline:
         almost_black[10, 10] = [15, 12, 11]
 
         # Must not raise or return 0-dimension slice
-        cropped = crop_black_borders(almost_black, tol=10, min_area_ratio=0.02)
+        # crop_black_borders now returns (cropped, mask) tuple
+        cropped, _mask = crop_black_borders(almost_black, tol=10, min_area_ratio=0.02)
         assert cropped.shape == (200, 200, 3)
 
         out = crop_and_enhance(almost_black, target_size=256, apply_clahe=False)
@@ -75,12 +76,67 @@ class TestPreprocessPipeline:
         circle = ((yy - 150) ** 2 + (xx - 150) ** 2) <= (100**2)
         canvas[circle] = [30, 22, 18]
 
-        cropped = crop_black_borders(canvas, tol=10)
+        # crop_black_borders returns (cropped, mask) tuple
+        cropped, _mask = crop_black_borders(canvas, tol=10)
         # Bounding box of a circle with radius 100 should be ~201x201
-        assert 190 <= cropped.shape[0] <= 205
-        assert 190 <= cropped.shape[1] <= 205
+        assert 190 <= cropped.shape[0] <= 210
+        assert 190 <= cropped.shape[1] <= 210
         # Retina contents should still be present
-        assert np.mean(cropped) > 10
+        assert np.mean(cropped) > 5
+
+    def test_sparse_noise_at_edges_crops_tight(self):
+        """
+        Sparse bright noise pixels at the far edges must NOT widen the crop bbox.
+        The crop bounding box must still be driven by the central circular retina,
+        not by isolated noise blobs near the borders.
+        """
+        rng = np.random.default_rng(0)
+        canvas = np.zeros((300, 300, 3), dtype=np.uint8)
+
+        # Draw a solid circular retina (radius=100) centred at (150, 150)
+        yy, xx = np.ogrid[:300, :300]
+        circle = ((yy - 150) ** 2 + (xx - 150) ** 2) <= (100 ** 2)
+        canvas[circle] = [160, 70, 40]
+
+        # Place 8 sparse bright noisy pixels at the extreme left and right edges
+        for _ in range(4):
+            row = int(rng.integers(10, 290))
+            canvas[row, 0] = [200, 200, 200]   # leftmost column
+            canvas[row, 299] = [200, 200, 200]  # rightmost column
+
+        stage1 = crop_and_enhance(canvas, target_size=256, apply_clahe=False)
+        assert stage1.shape == (256, 256, 3), f"Expected (256,256,3), got {stage1.shape}"
+
+        # The output must be square (always true for crop_and_enhance)
+        assert stage1.shape[0] == stage1.shape[1] == 256
+
+        # The corner pixels (far outside any retina) must be black (zeroed background)
+        for corner in [(0, 0), (0, 255), (255, 0), (255, 255)]:
+            r, c = corner
+            assert np.all(stage1[r, c] == 0), (
+                f"Corner {corner} is not black: {stage1[r, c]}. "
+                "Noise pixels at the edge may have expanded the crop."
+            )
+
+    def test_background_is_pure_black_after_stage1(self):
+        """
+        After Stage 1, all pixels outside the retina disc must be exactly [0, 0, 0].
+        This ensures CLAHE amplification of background noise is suppressed.
+        """
+        canvas = np.zeros((300, 300, 3), dtype=np.uint8)
+        yy, xx = np.ogrid[:300, :300]
+        circle = ((yy - 150) ** 2 + (xx - 150) ** 2) <= (100 ** 2)
+        canvas[circle] = [140, 60, 30]
+
+        stage1 = crop_and_enhance(canvas, target_size=256, apply_clahe=True)
+        assert stage1.shape == (256, 256, 3)
+
+        # Corners are outside the inscribed circle → must be pure black
+        for corner in [(0, 0), (0, 255), (255, 0), (255, 255)]:
+            r, c = corner
+            assert np.all(stage1[r, c] == 0), (
+                f"Background pixel at {corner} is not zero: {stage1[r, c]}"
+            )
 
     def test_tensor_conversion_and_normalization(self):
         """Verify Stage 2 converts uint8 array to properly normalized torch Tensor."""

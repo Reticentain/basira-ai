@@ -31,9 +31,17 @@ def crop_black_borders(
     img: np.ndarray,
     tol: int = 10,
     min_area_ratio: float = 0.02,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Detect the circular fundus region and crop away black surrounding borders.
+
+    Strategy (robust against JPEG background noise):
+      1. Convert to grayscale and apply a Gaussian blur to suppress isolated noise.
+      2. Threshold to obtain a binary foreground mask.
+      3. Apply morphological opening to remove small isolated foreground blobs.
+      4. Find connected components; keep only the LARGEST one (the retina disc).
+      5. If the largest component covers < min_area_ratio of total pixels, skip crop.
+      6. Use the tight bounding box of that component to crop.
 
     Parameters
     ----------
@@ -47,29 +55,69 @@ def crop_black_borders(
 
     Returns
     -------
-    np.ndarray
+    cropped : np.ndarray
         Cropped uint8 RGB image.
+    retina_mask : np.ndarray
+        uint8 binary mask (255 = retina, 0 = background) of the SAME spatial
+        extent as `cropped`, suitable for downstream background zeroing.
     """
     if img.ndim != 3 or img.shape[2] != 3:
         raise ValueError(f"Expected 3-channel RGB image, got shape {img.shape}")
 
     h, w = img.shape[:2]
-    # Check max channel intensity to robustly handle colored/dim retinas
-    mask = np.max(img, axis=2) > tol
 
-    # Safe fallback if mask is almost empty (e.g. nearly black photo or bad exposure)
-    if np.count_nonzero(mask) < min_area_ratio * (h * w):
-        return img
+    # --- Step 1: Grayscale + Gaussian blur to suppress JPEG noise ---
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    blur_k = max(5, (min(h, w) // 100) * 2 + 1)  # odd kernel, ~1% of smallest dim
+    blurred = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
 
-    y_indices, x_indices = np.where(mask)
-    ymin, ymax = int(y_indices.min()), int(y_indices.max())
-    xmin, xmax = int(x_indices.min()), int(x_indices.max())
+    # --- Step 2: Threshold ---
+    _, raw_mask = cv2.threshold(blurred, tol, 255, cv2.THRESH_BINARY)
+
+    # --- Step 3: Morphological opening to drop isolated noise pixels ---
+    open_k = max(15, (min(h, w) // 50) * 2 + 1)  # ~2% of smallest dim
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
+    cleaned = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, kernel)
+
+    # --- Step 4: Largest connected component ---
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        cleaned, connectivity=8
+    )
+
+    # Label 0 is background; find the largest foreground label
+    if num_labels < 2:
+        # No foreground component found after opening → skip crop
+        full_mask = np.full((h, w), 255, dtype=np.uint8)
+        return img, full_mask
+
+    # stats columns: LEFT, TOP, WIDTH, HEIGHT, AREA
+    fg_areas = stats[1:, cv2.CC_STAT_AREA]
+    largest_label = int(np.argmax(fg_areas)) + 1
+    largest_area = int(fg_areas[np.argmax(fg_areas)])
+
+    # --- Step 5: Check minimum area ---
+    if largest_area < min_area_ratio * (h * w):
+        full_mask = np.full((h, w), 255, dtype=np.uint8)
+        return img, full_mask
+
+    # --- Step 6: Tight bounding box of the largest component ---
+    component_mask = (labels == largest_label).astype(np.uint8) * 255
+
+    left   = int(stats[largest_label, cv2.CC_STAT_LEFT])
+    top    = int(stats[largest_label, cv2.CC_STAT_TOP])
+    cw     = int(stats[largest_label, cv2.CC_STAT_WIDTH])
+    ch     = int(stats[largest_label, cv2.CC_STAT_HEIGHT])
+    right  = left + cw
+    bottom = top + ch
 
     # Safeguard against degenerate boxes (< 10 px)
-    if (ymax - ymin < 10) or (xmax - xmin < 10):
-        return img
+    if ch < 10 or cw < 10:
+        full_mask = np.full((h, w), 255, dtype=np.uint8)
+        return img, full_mask
 
-    return img[ymin : ymax + 1, xmin : xmax + 1]
+    cropped = img[top:bottom, left:right]
+    retina_mask = component_mask[top:bottom, left:right]
+    return cropped, retina_mask
 
 
 def pad_to_square(img: np.ndarray, pad_value: int = 0) -> np.ndarray:
@@ -137,36 +185,49 @@ def crop_and_enhance(
     """
     Stage 1: Deterministic fundus preprocessing pipeline.
     Steps:
-      1. Crop black border
-      2. Pad to square
+      1. Crop black border (robust: blur → threshold → morph-open → largest CC bbox)
+      2. Pad to square (black padding, no stretch)
       3. Resize to target_size x target_size
       4. Apply CLAHE on L channel in LAB color space (optional)
+      5. Zero all pixels outside the retina mask (pure black background)
 
     Returns
     -------
     np.ndarray
         uint8 RGB image of shape (target_size, target_size, 3).
+        Pixels outside the retina circle are exactly 0.
     """
     if isinstance(img, Image.Image):
         img_np = np.array(img.convert("RGB"))
     else:
         img_np = img.copy()
 
-    # 1. Border crop
-    cropped = crop_black_borders(img_np, tol=tol)
+    # 1. Border crop → returns (cropped_img, retina_mask_at_crop_resolution)
+    cropped, retina_mask_crop = crop_black_borders(img_np, tol=tol)
 
-    # 2. Square pad (do not stretch)
+    # 2. Square pad (do not stretch) — apply same padding to both image and mask
     squared = pad_to_square(cropped)
+    # pad_to_square pads with 0, so just pad the mask with 0 (background) too
+    mask_3d = retina_mask_crop[:, :, np.newaxis]  # (H, W, 1)
+    squared_mask_3d = pad_to_square(mask_3d)
+    squared_mask = squared_mask_3d[:, :, 0]  # back to (H, W)
 
-    # 3. Resize
+    # 3. Resize image and mask to target_size
     interp = cv2.INTER_AREA if (squared.shape[0] >= target_size) else cv2.INTER_LINEAR
     resized = cv2.resize(squared, (target_size, target_size), interpolation=interp)
+    resized_mask = cv2.resize(
+        squared_mask, (target_size, target_size), interpolation=cv2.INTER_NEAREST
+    )
 
-    # 4. CLAHE enhancement
+    # 4. CLAHE enhancement on L channel in LAB space
     if apply_clahe:
         enhanced = apply_clahe_lab(resized, clip_limit=clahe_clip_limit, tile_grid=clahe_tile_grid)
     else:
         enhanced = resized
+
+    # 5. Zero pixels outside the retina mask so CLAHE noise in background is suppressed
+    retina_bool = resized_mask > 0  # (H, W) bool
+    enhanced[~retina_bool] = 0
 
     return enhanced
 
