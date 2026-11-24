@@ -82,6 +82,66 @@ class TestCacheTagAndManifest:
         with pytest.raises(ValueError, match="image_size mismatch"):
             validate_cache_manifest(cfg_copy)
 
+    def test_manifest_merge_preserves_other_sources(self, tmp_path):
+        """Writing manifest with merge=True must preserve counts from other sources."""
+        from basira.data.cache import read_manifest, write_manifest
+
+        cfg = load_config()
+        cfg_copy = cfg.copy()
+        cfg_copy.output.cache_root = str(tmp_path)
+
+        # 1. Write first source
+        write_manifest({"aptos": 100}, cfg=cfg_copy, merge=True)
+        m1 = read_manifest(cfg_copy)
+        assert m1["counts"] == {"aptos": 100}
+
+        # 2. Write second source: must keep aptos and add eyepacs_train
+        write_manifest({"eyepacs_train": 200}, cfg=cfg_copy, merge=True)
+        m2 = read_manifest(cfg_copy)
+        assert m2["counts"] == {"aptos": 100, "eyepacs_train": 200}
+
+        # 3. Update first source: must update aptos and keep eyepacs_train
+        write_manifest({"aptos": 105}, cfg=cfg_copy, merge=True)
+        m3 = read_manifest(cfg_copy)
+        assert m3["counts"] == {"aptos": 105, "eyepacs_train": 200}
+
+    def test_stale_temp_file_cleanup_and_counting(self, tmp_path):
+        """Stray .tmp_* files must be ignored during counting and removed by cleanup."""
+        import sys
+        # Ensure scripts/ can be imported
+        repo_root = pathlib.Path(__file__).resolve().parent.parent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+
+        from scripts.build_cache import cleanup_stale_temp_files, get_final_png_files
+
+        source_dir = tmp_path / "test_source"
+        source_dir.mkdir(parents=True)
+
+        # Create valid final PNG files
+        (source_dir / "valid_001.png").write_bytes(b"dummy_png_data_1")
+        (source_dir / "valid_002.png").write_bytes(b"dummy_png_data_2")
+
+        # Create stray temporary files
+        (source_dir / ".tmp_123_valid_003.png").write_bytes(b"truncated_temp_data")
+        (source_dir / ".tmp_456_manifest.json").write_bytes(b"temp_manifest")
+
+        # 1. get_final_png_files must strictly ignore the .tmp_* files
+        final_pngs = get_final_png_files(source_dir)
+        final_names = {p.name for p in final_pngs}
+        assert final_names == {"valid_001.png", "valid_002.png"}
+        assert len(final_pngs) == 2
+
+        # 2. cleanup_stale_temp_files must remove only the .tmp_* files
+        removed_count = cleanup_stale_temp_files(source_dir)
+        assert removed_count == 2
+        assert not (source_dir / ".tmp_123_valid_003.png").exists()
+        assert not (source_dir / ".tmp_456_manifest.json").exists()
+
+        # 3. Valid files must remain untouched
+        assert (source_dir / "valid_001.png").exists()
+        assert (source_dir / "valid_002.png").exists()
+
 
 class TestCachedImagesIntegrity:
     @pytest.fixture(autouse=True)

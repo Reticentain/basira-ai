@@ -114,6 +114,7 @@ def write_manifest(
     counts: dict[str, int],
     cfg: Optional[DictConfig] = None,
     git_commit: Optional[str] = None,
+    merge: bool = True,
 ) -> pathlib.Path:
     """
     Write manifest.json atomically to the tag folder.
@@ -126,16 +127,33 @@ def write_manifest(
         Active configuration.
     git_commit : str, optional
         Commit hash; auto-detected if None.
+    merge : bool, default True
+        If True and an existing manifest exists with the same cache_tag,
+        the new counts are merged into existing counts so building a
+        single source never drops previously recorded sources.
     """
     if cfg is None:
         cfg = load_config()
 
-    if git_commit is None:
-        git_commit = get_current_git_commit()
-
     tag = compute_cache_tag(cfg)
     c_dir = cache_dir(cfg)
     c_dir.mkdir(parents=True, exist_ok=True)
+    manifest_file = get_manifest_path(cfg)
+
+    existing_counts: dict[str, int] = {}
+    if merge and manifest_file.exists():
+        try:
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                old_data = json.load(f)
+            if old_data.get("cache_tag") == tag and isinstance(old_data.get("counts"), dict):
+                existing_counts = dict(old_data["counts"])
+        except Exception:
+            existing_counts = {}
+
+    merged_counts = {**existing_counts, **counts}
+
+    if git_commit is None:
+        git_commit = get_current_git_commit()
 
     manifest_data = {
         "cache_tag": tag,
@@ -148,10 +166,9 @@ def write_manifest(
             "clahe_clip_limit": float(cfg.image.clahe_clip_limit),
             "clahe_tile_grid": list(cfg.image.clahe_tile_grid),
         },
-        "counts": counts,
+        "counts": merged_counts,
     }
 
-    manifest_file = get_manifest_path(cfg)
     tmp_file = c_dir / f".tmp_{os.getpid()}_manifest.json"
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(manifest_data, f, indent=2)

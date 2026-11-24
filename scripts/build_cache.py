@@ -190,13 +190,47 @@ def load_unique_source_images(source: str, cfg: Any) -> list[tuple[str, str]]:
     return sorted(unique_items.items(), key=lambda x: x[0])
 
 
+def cleanup_stale_temp_files(directory: pathlib.Path) -> int:
+    """
+    Delete any leftover temporary files (.tmp_*) in the folder.
+
+    Returns the number of removed temp files.
+    """
+    if not directory.exists():
+        return 0
+    removed = 0
+    for p in directory.iterdir():
+        if p.is_file() and p.name.startswith(".tmp_"):
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def get_final_png_files(directory: pathlib.Path) -> list[pathlib.Path]:
+    """
+    Return all valid final .png files in directory, strictly excluding
+    any hidden or temporary files (.tmp_*, .*, etc.).
+    """
+    if not directory.exists():
+        return []
+    return [
+        p for p in directory.glob("*.png")
+        if not p.name.startswith(".")
+    ]
+
+
 def get_dir_size_bytes(directory: pathlib.Path) -> int:
-    """Calculate total size of all regular files in a directory."""
+    """Calculate total size of valid final PNG files in a directory."""
     if not directory.exists():
         return 0
     total = 0
     for root, _, files in os.walk(directory):
         for f in files:
+            if f.startswith(".") or not f.endswith(".png"):
+                continue
             p = pathlib.Path(root) / f
             try:
                 total += p.stat().st_size
@@ -245,11 +279,16 @@ def try_restore_from_drive(source: str, expected_count: int, cfg: Any) -> bool:
 
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
-            namelist = [name for name in zf.namelist() if not name.endswith("/")]
+            namelist = [
+                name for name in zf.namelist()
+                if not name.endswith("/")
+                and not pathlib.Path(name).name.startswith(".")
+                and name.endswith(".png")
+            ]
             zip_count = len(namelist)
             if zip_count != expected_count:
                 print(
-                    f"[{source}] WARNING: Archive contains {zip_count} files, "
+                    f"[{source}] WARNING: Archive contains {zip_count} valid PNG files, "
                     f"expected {expected_count}. Rejecting zip, will rebuild."
                 )
                 return False
@@ -258,8 +297,8 @@ def try_restore_from_drive(source: str, expected_count: int, cfg: Any) -> bool:
             dest_dir.mkdir(parents=True, exist_ok=True)
             zf.extractall(dest_dir)
 
-        # Verify extracted files on disk
-        extracted_pngs = list(dest_dir.glob("*.png"))
+        # Verify extracted files on disk (strictly excluding temp/hidden files)
+        extracted_pngs = get_final_png_files(dest_dir)
         if len(extracted_pngs) == expected_count:
             print(f"[{source}] ✓ Restore verified: {len(extracted_pngs)}/{expected_count} files intact.")
             return True
@@ -277,6 +316,7 @@ def try_restore_from_drive(source: str, expected_count: int, cfg: Any) -> bool:
 def zip_source_to_drive(source: str, source_dir: pathlib.Path, cfg: Any) -> None:
     """
     Create an uncompressed ZIP archive on Google Drive, verifying >= 2 GB free space margin.
+    Atomically overwrites an existing zip file for the same source.
     """
     tag = compute_cache_tag(cfg)
     drive_cache_dir = pathlib.Path(cfg.output.drive_root) / "cache" / tag
@@ -285,7 +325,7 @@ def zip_source_to_drive(source: str, source_dir: pathlib.Path, cfg: Any) -> None
     final_zip = drive_cache_dir / f"{source}.zip"
     partial_zip = drive_cache_dir / f"{source}.zip.partial"
 
-    # Measure source directory size
+    # Measure source directory size (final PNG files only)
     source_size = get_dir_size_bytes(source_dir)
     drive_free = get_drive_free_space(drive_cache_dir)
 
@@ -306,14 +346,16 @@ def zip_source_to_drive(source: str, source_dir: pathlib.Path, cfg: Any) -> None
         with zipfile.ZipFile(partial_zip, "w", compression=zipfile.ZIP_STORED) as zf:
             for root, _, files in os.walk(source_dir):
                 for f in files:
+                    if f.startswith(".") or not f.endswith(".png"):
+                        continue
                     file_p = pathlib.Path(root) / f
                     arcname = file_p.relative_to(source_dir)
                     zf.write(file_p, arcname=str(arcname))
 
-        # Atomic rename once complete
+        # Atomic rename once complete — overwrites final_zip if one already exists
         if partial_zip.exists():
             os.replace(partial_zip, final_zip)
-            print(f"  ✓ Saved to Drive: {final_zip} ({format_bytes(final_zip.stat().st_size)})")
+            print(f"  ✓ Saved to Drive (overwrote existing if present): {final_zip} ({format_bytes(final_zip.stat().st_size)})")
     except Exception as exc:
         print(f"  [ERROR] Archiving failed: {exc}")
         if partial_zip.exists():
@@ -329,7 +371,7 @@ def build_cache_for_source(
     pool: multiprocessing.Pool,
     restore: bool = False,
     dry_run: bool = False,
-) -> tuple[int, int, list[tuple[str, str]]]:
+) -> tuple[int, int, list[tuple[str, str]], int]:
     """
     Build or restore cache for a single dataset source.
 
@@ -338,6 +380,7 @@ def build_cache_for_source(
     written_count : int
     skipped_count : int
     failed_items : list of (image_id, error_msg)
+    verified_count : int
     """
     items = load_unique_source_images(source, cfg)
     expected_count = len(items)
@@ -347,19 +390,31 @@ def build_cache_for_source(
     print(f"{'=' * 70}")
 
     dest_dir = cache_dir(cfg) / source
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean up stale temp files (.tmp_*) before starting build
+    stale_removed = cleanup_stale_temp_files(dest_dir)
+    if stale_removed > 0:
+        print(f"[{source}] Cleaned up {stale_removed} stale temp file(s) (.tmp_*).")
 
     # Try restore if requested
     if restore:
-        if dest_dir.exists() and len(list(dest_dir.glob("*.png"))) == expected_count:
+        existing_valid = get_final_png_files(dest_dir)
+        if len(existing_valid) == expected_count:
             print(f"[{source}] Cache already populated on disk with {expected_count} files. Skipping.")
-            return 0, expected_count, []
+            if not dry_run:
+                write_manifest({source: expected_count}, cfg=cfg, merge=True)
+            return 0, expected_count, [], expected_count
+
         restored = try_restore_from_drive(source, expected_count, cfg)
         if restored:
-            return 0, expected_count, []
+            if not dry_run:
+                write_manifest({source: expected_count}, cfg=cfg, merge=True)
+            return 0, expected_count, [], expected_count
 
     if dry_run:
         print(f"  [DRY RUN] Would process {expected_count} images for source '{source}'.")
-        return 0, 0, []
+        return 0, 0, [], 0
 
     prep_kwargs = {
         "target_size": int(cfg.image.size),
@@ -378,8 +433,6 @@ def build_cache_for_source(
     skipped_count = 0
     failed_items: list[tuple[str, str]] = []
 
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
     with tqdm(total=expected_count, desc=f"Caching {source}", unit="img") as pbar:
         for status, iid, err in pool.imap_unordered(_process_single_image, work_items, chunksize=32):
             if status == "written":
@@ -391,16 +444,19 @@ def build_cache_for_source(
             pbar.update(1)
 
     # Verification: check total cached files on disk against expected unique images
-    cached_pngs = {p.name for p in dest_dir.glob("*.png")}
+    # Strictly count only final <stem>.png files, never temporary or hidden files
+    cached_png_paths = get_final_png_files(dest_dir)
+    cached_pngs = {p.name for p in cached_png_paths}
     expected_names = {f"{pathlib.Path(iid).stem}.png" for iid, _ in items}
     missing_names = expected_names - cached_pngs
+    total_on_disk = len(cached_pngs)
 
     dir_size = get_dir_size_bytes(dest_dir)
     print(f"\n--- {source} Summary ---")
     print(f"  Written : {written_count}")
     print(f"  Skipped : {skipped_count}")
     print(f"  Failed  : {len(failed_items)}")
-    print(f"  Total on disk: {len(cached_pngs)} / {expected_count} ({format_bytes(dir_size)})")
+    print(f"  Total on disk: {total_on_disk} / {expected_count} ({format_bytes(dir_size)})")
 
     if missing_names:
         print(f"  [WARNING] {len(missing_names)} expected images are missing from cache!")
@@ -414,11 +470,15 @@ def build_cache_for_source(
         for iid, err in failed_items:
             print(f"    - {iid}: {err}")
 
+    # Record verified count in manifest right after final-file check, merging with existing
+    if not dry_run:
+        write_manifest({source: total_on_disk}, cfg=cfg, merge=True)
+
     # Zip to Google Drive if no failures and all files present
     if not failed_items and not missing_names and not dry_run:
         zip_source_to_drive(source, dest_dir, cfg)
 
-    return written_count, skipped_count, failed_items
+    return written_count, skipped_count, failed_items, total_on_disk
 
 
 def main() -> None:
@@ -460,7 +520,7 @@ def main() -> None:
     num_workers = max(1, os.cpu_count() or 1)
     with multiprocessing.Pool(processes=num_workers, initializer=_worker_init) as pool:
         for src in sources_to_build:
-            written, skipped, fails = build_cache_for_source(
+            written, skipped, fails, verified_count = build_cache_for_source(
                 src,
                 cfg=cfg,
                 pool=pool,
@@ -470,12 +530,11 @@ def main() -> None:
             for iid, err in fails:
                 total_failures.append((src, iid, err))
 
-            dest = cache_dir(cfg) / src
-            source_counts[src] = len(list(dest.glob("*.png"))) if dest.exists() else 0
+            source_counts[src] = verified_count
 
     if not args.dry_run:
-        manifest_p = write_manifest(source_counts, cfg=cfg)
-        print(f"\n✓ Manifest written to: {manifest_p}")
+        manifest_p = write_manifest(source_counts, cfg=cfg, merge=True)
+        print(f"\n✓ Manifest updated at: {manifest_p}")
 
     print("\n" + "=" * 70)
     if total_failures:
