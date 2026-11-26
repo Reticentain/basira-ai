@@ -25,6 +25,7 @@ from omegaconf import DictConfig
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 from basira.config import load_config
 from basira.data.cache import cache_path, validate_cache_manifest
@@ -132,8 +133,12 @@ class CachedFundusDataset(Dataset):
             self.transform = transforms.Compose([
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomVerticalFlip(p=0.5),
-                transforms.RandomRotation(degrees=20, fill=0),
-                transforms.RandomAffine(degrees=0, scale=(0.9, 1.1), fill=0),
+                transforms.RandomAffine(
+                    degrees=20,
+                    scale=(0.9, 1.1),
+                    interpolation=InterpolationMode.BILINEAR,
+                    fill=0,
+                ),
                 transforms.ColorJitter(brightness=0.1, contrast=0.1),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=mean, std=std),

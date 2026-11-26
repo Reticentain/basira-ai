@@ -107,7 +107,7 @@ class TestTrainingAndResume:
         train_ds = CachedFundusDataset(df_train, cfg=cfg, train=True, task="referable")
         val_ds = CachedFundusDataset(df_val, cfg=cfg, train=False, task="referable")
 
-        train_loader = DataLoader(train_ds, batch_size=2, shuffle=False)
+        train_loader = DataLoader(train_ds, batch_size=2, shuffle=False, drop_last=True)
         val_loader = DataLoader(val_ds, batch_size=2, shuffle=False)
 
         # Lightweight model for CPU smoke testing
