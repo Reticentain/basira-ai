@@ -2,8 +2,9 @@
 tests/test_train.py
 ===================
 Unit tests for baseline training pipeline and checkpoint resumption:
-  - Verifies checkpoint saving (last.pt, best.pt, metrics.csv, run_info.json)
-  - Verifies --resume restores epoch, optimizer, scheduler, and RNG states
+  - Verifies checkpoint saving and loading with full real Python/NumPy/Torch RNG states
+  - Catches PyTorch 2.6+ weights_only=True UnpicklingError regression
+  - Verifies early-stopping counter (epochs_no_improve) and best metrics are saved and restored on resume
   - Runs completely on CPU using synthetic images without requiring a GPU
 """
 
@@ -12,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import random
 import numpy as np
 import pandas as pd
 import pytest
@@ -26,6 +28,7 @@ from basira.data.cache import cache_dir, write_manifest
 from basira.data.dataset import CachedFundusDataset
 from scripts.train import (
     evaluate,
+    load_checkpoint,
     save_checkpoint_atomic,
     train_one_epoch,
 )
@@ -93,8 +96,11 @@ def synthetic_train_env(tmp_path):
 
 
 class TestTrainingAndResume:
-    def test_train_epoch_and_resume_continuation(self, synthetic_train_env):
-        """Train 1 epoch, save last.pt, then resume and verify continuation at epoch 2."""
+    def test_train_epoch_and_resume_with_real_rng_states(self, synthetic_train_env):
+        """
+        Train 1 epoch, save last.pt with real Python/NumPy/Torch RNG states,
+        and verify load_checkpoint successfully unpickles without PyTorch 2.6+ UnpicklingError.
+        """
         cfg, df_train, df_val, ckpt_root = synthetic_train_env
         device = torch.device("cpu")
 
@@ -138,26 +144,46 @@ class TestTrainingAndResume:
         )
         scheduler.step()
 
+        # Capture REAL RNG states including NumPy RNG state tuple (which triggers weights_only=True UnpicklingError)
+        real_rng_states = {
+            "python_rng": random.getstate(),
+            "numpy_rng": np.random.get_state(),
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": None,
+        }
+
         state_epoch1 = {
             "epoch": 1,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": None,
             "best_metric": val_metrics["val_auc"],
             "best_epoch": 1,
+            "best_threshold": val_metrics["val_threshold"],
+            "epochs_no_improve": 0,
+            "rng_states": real_rng_states,
+            "config": {},
+            "task": "referable",
         }
         save_checkpoint_atomic(state_epoch1, last_pt)
 
         assert last_pt.exists()
-        loaded_e1 = torch.load(last_pt, map_location=device)
+
+        # Must load cleanly via load_checkpoint (weights_only=False)
+        loaded_e1 = load_checkpoint(last_pt, device=device)
         assert loaded_e1["epoch"] == 1
+        assert loaded_e1["epochs_no_improve"] == 0
+        assert "rng_states" in loaded_e1
+        # Verify NumPy RNG state can be restored without error
+        np.random.set_state(loaded_e1["rng_states"]["numpy_rng"])
 
         # --- Simulate Resume for Epoch 2 ---
         resume_model = timm.create_model("mobilenetv3_large_100", pretrained=False, num_classes=1)
         resume_opt = torch.optim.AdamW(resume_model.parameters(), lr=1e-4)
         resume_sched = torch.optim.lr_scheduler.CosineAnnealingLR(resume_opt, T_max=2)
 
-        ckpt = torch.load(last_pt, map_location=device)
+        ckpt = load_checkpoint(last_pt, device=device)
         resume_model.load_state_dict(ckpt["model_state_dict"])
         resume_opt.load_state_dict(ckpt["optimizer_state_dict"])
         resume_sched.load_state_dict(ckpt["scheduler_state_dict"])
@@ -191,11 +217,85 @@ class TestTrainingAndResume:
             "model_state_dict": resume_model.state_dict(),
             "optimizer_state_dict": resume_opt.state_dict(),
             "scheduler_state_dict": resume_sched.state_dict(),
+            "scaler_state_dict": None,
             "best_metric": val_metrics_e2["val_auc"],
             "best_epoch": 2,
+            "best_threshold": val_metrics_e2["val_threshold"],
+            "epochs_no_improve": 0,
+            "rng_states": {
+                "python_rng": random.getstate(),
+                "numpy_rng": np.random.get_state(),
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": None,
+            },
+            "config": {},
+            "task": "referable",
         }
         save_checkpoint_atomic(state_epoch2, last_pt)
 
         # Checkpoint is now updated to epoch 2
-        loaded_e2 = torch.load(last_pt, map_location=device)
+        loaded_e2 = load_checkpoint(last_pt, device=device)
         assert loaded_e2["epoch"] == 2
+
+    def test_early_stopping_counter_and_best_metric_restored_on_resume(self, synthetic_train_env):
+        """
+        Verify that early stopping counter (epochs_no_improve), best_metric,
+        and best_threshold are preserved in checkpoints and accurately restored on resume.
+        """
+        cfg, df_train, df_val, ckpt_root = synthetic_train_env
+        device = torch.device("cpu")
+
+        run_dir = ckpt_root / "early_stop_test_run"
+        run_dir.mkdir(parents=True)
+        last_pt = run_dir / "last.pt"
+
+        model = timm.create_model("mobilenetv3_large_100", pretrained=False, num_classes=1)
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=10)
+
+        # Simulate checkpoint at epoch 4 where best was at epoch 2 (AUC=0.88), so epochs_no_improve = 2
+        simulated_state = {
+            "epoch": 4,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "scheduler_state_dict": sched.state_dict(),
+            "scaler_state_dict": None,
+            "best_metric": 0.88,
+            "best_epoch": 2,
+            "best_threshold": 0.42,
+            "epochs_no_improve": 2,  # 2 epochs without improvement
+            "rng_states": {
+                "python_rng": random.getstate(),
+                "numpy_rng": np.random.get_state(),
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": None,
+            },
+            "config": {},
+            "task": "referable",
+        }
+        save_checkpoint_atomic(simulated_state, last_pt)
+
+        # Restore on resume
+        ckpt = load_checkpoint(last_pt, device=device)
+
+        start_epoch = int(ckpt["epoch"]) + 1
+        restored_best_auc = float(ckpt["best_metric"])
+        restored_best_epoch = int(ckpt["best_epoch"])
+        restored_best_thresh = float(ckpt["best_threshold"])
+        restored_epochs_no_improve = int(ckpt["epochs_no_improve"])
+
+        assert start_epoch == 5
+        assert restored_best_auc == 0.88
+        assert restored_best_epoch == 2
+        assert restored_best_thresh == 0.42
+        assert restored_epochs_no_improve == 2, (
+            f"Expected restored epochs_no_improve=2, got {restored_epochs_no_improve}"
+        )
+
+        # Verify that if patience is 5, reaching 3 more non-improving epochs hits patience
+        patience = 5
+        for sim_epoch in range(start_epoch, start_epoch + 3):
+            # Model does not improve
+            restored_epochs_no_improve += 1
+
+        assert restored_epochs_no_improve == patience

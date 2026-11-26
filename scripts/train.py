@@ -97,6 +97,18 @@ def save_checkpoint_atomic(state: dict[str, Any], filepath: pathlib.Path) -> Non
     os.replace(tmp_path, filepath)
 
 
+def load_checkpoint(filepath: pathlib.Path | str, device: torch.device) -> dict[str, Any]:
+    """
+    Load a checkpoint containing model weights, optimizer/scheduler states, and RNG states.
+
+    weights_only=False is explicitly specified because our checkpoints contain full
+    Python dicts and NumPy RNG states (np.random.get_state()) required for deterministic
+    resumption. These checkpoints are authored and saved exclusively by Basira AI on
+    our own Google Drive / local storage.
+    """
+    return torch.load(filepath, map_location=device, weights_only=False)
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -393,25 +405,33 @@ def main() -> None:
     last_pt_path = ckpt_dir / "last.pt"
     if args.resume and last_pt_path.exists():
         print(f"Loading checkpoint for resume: {last_pt_path}")
-        ckpt = torch.load(last_pt_path, map_location=device)
+        ckpt = load_checkpoint(last_pt_path, device=device)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if use_amp and "scaler_state_dict" in ckpt:
+        if use_amp and "scaler_state_dict" in ckpt and ckpt["scaler_state_dict"] is not None:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_epoch = int(ckpt["epoch"]) + 1
         best_val_auc = float(ckpt.get("best_metric", -1.0))
         best_epoch = int(ckpt.get("best_epoch", 0))
+        best_threshold = float(ckpt.get("best_threshold", 0.5))
+        epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
 
         # Restore RNG states
-        if "rng_states" in ckpt:
+        if "rng_states" in ckpt and ckpt["rng_states"] is not None:
             rng = ckpt["rng_states"]
-            random.setstate(rng["python_rng"])
-            np.random.set_state(rng["numpy_rng"])
-            torch.set_rng_state(rng["torch_rng"])
-            if device.type == "cuda" and torch.cuda.is_available() and "cuda_rng" in rng:
+            if "python_rng" in rng and rng["python_rng"] is not None:
+                random.setstate(rng["python_rng"])
+            if "numpy_rng" in rng and rng["numpy_rng"] is not None:
+                np.random.set_state(rng["numpy_rng"])
+            if "torch_rng" in rng and rng["torch_rng"] is not None:
+                torch.set_rng_state(rng["torch_rng"])
+            if device.type == "cuda" and torch.cuda.is_available() and "cuda_rng" in rng and rng["cuda_rng"] is not None:
                 torch.cuda.set_rng_state_all(rng["cuda_rng"])
-        print(f"Resumed from epoch {start_epoch - 1}. Current best val AUC: {best_val_auc:.4f}")
+        print(
+            f"Resumed from epoch {start_epoch - 1}. Current best val AUC: {best_val_auc:.4f} "
+            f"(epoch {best_epoch}), early stopping counter: {epochs_no_improve}/{patience}"
+        )
 
     metrics_csv_path = ckpt_dir / "metrics.csv"
     if not metrics_csv_path.exists():
@@ -477,7 +497,18 @@ def main() -> None:
                 f"{curr_lr:.6e},{epoch_time:.2f},{img_per_sec:.2f}\n"
             )
 
-        # Checkpoint state
+        # Check if validation AUC improved
+        improved = False
+        if not np.isnan(val_auc) and val_auc > best_val_auc:
+            best_val_auc = val_auc
+            best_threshold = val_thresh
+            best_epoch = epoch
+            epochs_no_improve = 0
+            improved = True
+        else:
+            epochs_no_improve += 1
+
+        # Checkpoint state containing all training, model, early-stopping, and RNG states
         rng_states = {
             "python_rng": random.getstate(),
             "numpy_rng": np.random.get_state(),
@@ -493,6 +524,8 @@ def main() -> None:
             "scaler_state_dict": scaler.state_dict() if use_amp else None,
             "best_metric": best_val_auc,
             "best_epoch": best_epoch,
+            "best_threshold": best_threshold,
+            "epochs_no_improve": epochs_no_improve,
             "rng_states": rng_states,
             "config": OmegaConf.to_container(cfg, resolve=True),
             "task": args.task,
@@ -501,14 +534,8 @@ def main() -> None:
         # Atomically save last.pt every epoch
         save_checkpoint_atomic(ckpt_state, last_pt_path)
 
-        # Save best.pt if AUC improved
-        if not np.isnan(val_auc) and val_auc > best_val_auc:
-            best_val_auc = val_auc
-            best_threshold = val_thresh
-            best_epoch = epoch
-            epochs_no_improve = 0
-            ckpt_state["best_metric"] = best_val_auc
-            ckpt_state["best_epoch"] = best_epoch
+        # Save best.pt and run_info.json if AUC improved
+        if improved:
             save_checkpoint_atomic(ckpt_state, ckpt_dir / "best.pt")
             print(f"  ✓ New best model saved! (Val AUC: {best_val_auc:.4f} at epoch {epoch})")
 
@@ -521,6 +548,7 @@ def main() -> None:
                 "best_epoch": best_epoch,
                 "best_val_auc": float(best_val_auc),
                 "chosen_val_threshold": float(best_threshold),
+                "epochs_no_improve": epochs_no_improve,
                 "config": OmegaConf.to_container(cfg, resolve=True),
             }
             tmp_info = ckpt_dir / f".tmp_{os.getpid()}_run_info.json"
@@ -528,7 +556,6 @@ def main() -> None:
                 json.dump(run_info, f, indent=2)
             os.replace(tmp_info, ckpt_dir / "run_info.json")
         else:
-            epochs_no_improve += 1
             if epochs_no_improve >= patience:
                 print(f"\n[EARLY STOPPING] Validation AUC did not improve for {patience} consecutive epochs. Stopping.")
                 break
