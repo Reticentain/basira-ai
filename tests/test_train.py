@@ -29,6 +29,7 @@ from basira.data.dataset import CachedFundusDataset
 from scripts.train import (
     evaluate,
     load_checkpoint,
+    restore_rng_states,
     save_checkpoint_atomic,
     train_one_epoch,
 )
@@ -170,20 +171,20 @@ class TestTrainingAndResume:
 
         assert last_pt.exists()
 
-        # Must load cleanly via load_checkpoint (weights_only=False)
-        loaded_e1 = load_checkpoint(last_pt, device=device)
+        # Must load cleanly via load_checkpoint (weights_only=False, map_location='cpu')
+        loaded_e1 = load_checkpoint(last_pt, map_location="cpu")
         assert loaded_e1["epoch"] == 1
         assert loaded_e1["epochs_no_improve"] == 0
         assert "rng_states" in loaded_e1
-        # Verify NumPy RNG state can be restored without error
-        np.random.set_state(loaded_e1["rng_states"]["numpy_rng"])
+        # Restore RNG states through restore_rng_states
+        restore_rng_states(loaded_e1["rng_states"], device=device)
 
         # --- Simulate Resume for Epoch 2 ---
         resume_model = timm.create_model("mobilenetv3_large_100", pretrained=False, num_classes=1)
         resume_opt = torch.optim.AdamW(resume_model.parameters(), lr=1e-4)
         resume_sched = torch.optim.lr_scheduler.CosineAnnealingLR(resume_opt, T_max=2)
 
-        ckpt = load_checkpoint(last_pt, device=device)
+        ckpt = load_checkpoint(last_pt, map_location="cpu")
         resume_model.load_state_dict(ckpt["model_state_dict"])
         resume_opt.load_state_dict(ckpt["optimizer_state_dict"])
         resume_sched.load_state_dict(ckpt["scheduler_state_dict"])
@@ -234,7 +235,7 @@ class TestTrainingAndResume:
         save_checkpoint_atomic(state_epoch2, last_pt)
 
         # Checkpoint is now updated to epoch 2
-        loaded_e2 = load_checkpoint(last_pt, device=device)
+        loaded_e2 = load_checkpoint(last_pt, map_location="cpu")
         assert loaded_e2["epoch"] == 2
 
     def test_early_stopping_counter_and_best_metric_restored_on_resume(self, synthetic_train_env):
@@ -276,7 +277,7 @@ class TestTrainingAndResume:
         save_checkpoint_atomic(simulated_state, last_pt)
 
         # Restore on resume
-        ckpt = load_checkpoint(last_pt, device=device)
+        ckpt = load_checkpoint(last_pt, map_location="cpu")
 
         start_epoch = int(ckpt["epoch"]) + 1
         restored_best_auc = float(ckpt["best_metric"])
@@ -299,3 +300,79 @@ class TestTrainingAndResume:
             restored_epochs_no_improve += 1
 
         assert restored_epochs_no_improve == patience
+
+    def test_restore_rng_states_works_on_cpu_tensors(self):
+        """restore_rng_states must properly restore Python, NumPy, and PyTorch CPU states."""
+        device = torch.device("cpu")
+        rng = {
+            "python_rng": random.getstate(),
+            "numpy_rng": np.random.get_state(),
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": None,
+        }
+        restore_rng_states(rng, device=device)
+        assert torch.get_rng_state() is not None
+
+    def test_checkpoint_loading_returns_no_cuda_tensors(self, synthetic_train_env):
+        """load_checkpoint with default map_location='cpu' returns all tensors on CPU."""
+        cfg, df_train, df_val, ckpt_root = synthetic_train_env
+        run_dir = ckpt_root / "cpu_tensor_check"
+        run_dir.mkdir(parents=True)
+        ckpt_path = run_dir / "last.pt"
+
+        state = {
+            "epoch": 1,
+            "model_state_dict": {"dummy_weight": torch.randn(3, 3)},
+            "optimizer_state_dict": {},
+            "scheduler_state_dict": {},
+            "scaler_state_dict": None,
+            "best_metric": 0.5,
+            "best_epoch": 1,
+            "best_threshold": 0.5,
+            "epochs_no_improve": 0,
+            "rng_states": {
+                "python_rng": random.getstate(),
+                "numpy_rng": np.random.get_state(),
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": None,
+            },
+            "config": {},
+            "task": "referable",
+        }
+        save_checkpoint_atomic(state, ckpt_path)
+
+        loaded = load_checkpoint(ckpt_path)
+
+        # Check model state dict tensors are on CPU
+        for k, v in loaded["model_state_dict"].items():
+            if isinstance(v, torch.Tensor):
+                assert v.device.type == "cpu", f"Tensor {k} is on {v.device}, expected CPU"
+
+        # Check torch_rng tensor is on CPU
+        torch_rng = loaded["rng_states"]["torch_rng"]
+        if isinstance(torch_rng, torch.Tensor):
+            assert torch_rng.device.type == "cpu", f"torch_rng is on {torch_rng.device}, expected CPU"
+
+    def test_restore_rng_states_with_cuda_tensors(self):
+        """
+        If CUDA is available, verify that RNG states stored as CUDA tensors
+        are safely converted to CPU ByteTensor without raising TypeError.
+        """
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA runtime not available on this machine.")
+
+        device = torch.device("cuda")
+
+        # Simulate checkpoint where torch_rng was moved to GPU by map_location=device
+        torch_rng_cuda = torch.get_rng_state().cuda()
+        cuda_rng_states = [x.cuda() for x in torch.cuda.get_rng_state_all()]
+
+        rng_with_cuda_tensors = {
+            "python_rng": random.getstate(),
+            "numpy_rng": np.random.get_state(),
+            "torch_rng": torch_rng_cuda,
+            "cuda_rng": cuda_rng_states,
+        }
+
+        # Must NOT raise: "TypeError: RNG state must be a torch.ByteTensor"
+        restore_rng_states(rng_with_cuda_tensors, device=device)

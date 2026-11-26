@@ -97,16 +97,44 @@ def save_checkpoint_atomic(state: dict[str, Any], filepath: pathlib.Path) -> Non
     os.replace(tmp_path, filepath)
 
 
-def load_checkpoint(filepath: pathlib.Path | str, device: torch.device) -> dict[str, Any]:
+def load_checkpoint(filepath: pathlib.Path | str, map_location: str | torch.device = "cpu") -> dict[str, Any]:
     """
     Load a checkpoint containing model weights, optimizer/scheduler states, and RNG states.
 
+    Always loads with map_location="cpu" by default to ensure RNG state tensors remain on CPU
+    (preventing TypeError: RNG state must be a torch.ByteTensor on CUDA runtimes).
     weights_only=False is explicitly specified because our checkpoints contain full
     Python dicts and NumPy RNG states (np.random.get_state()) required for deterministic
     resumption. These checkpoints are authored and saved exclusively by Basira AI on
     our own Google Drive / local storage.
     """
-    return torch.load(filepath, map_location=device, weights_only=False)
+    return torch.load(filepath, map_location=map_location, weights_only=False)
+
+
+def restore_rng_states(rng: dict[str, Any], device: torch.device) -> None:
+    """
+    Restore Python, NumPy, and PyTorch RNG states safely across CPU and CUDA.
+
+    PyTorch requires torch.set_rng_state and torch.cuda.set_rng_state_all to receive
+    CPU ByteTensors (torch.uint8). This converts torch_rng and each entry of cuda_rng
+    with torch.as_tensor(x, dtype=torch.uint8).cpu() before restoring.
+    """
+    if not rng:
+        return
+
+    if "python_rng" in rng and rng["python_rng"] is not None:
+        random.setstate(rng["python_rng"])
+
+    if "numpy_rng" in rng and rng["numpy_rng"] is not None:
+        np.random.set_state(rng["numpy_rng"])
+
+    if "torch_rng" in rng and rng["torch_rng"] is not None:
+        torch_state = torch.as_tensor(rng["torch_rng"], dtype=torch.uint8).cpu()
+        torch.set_rng_state(torch_state)
+
+    if device.type == "cuda" and torch.cuda.is_available() and rng.get("cuda_rng") is not None:
+        cuda_states = [torch.as_tensor(x, dtype=torch.uint8).cpu() for x in rng["cuda_rng"]]
+        torch.cuda.set_rng_state_all(cuda_states)
 
 
 def train_one_epoch(
@@ -406,7 +434,7 @@ def main() -> None:
     last_pt_path = ckpt_dir / "last.pt"
     if args.resume and last_pt_path.exists():
         print(f"Loading checkpoint for resume: {last_pt_path}")
-        ckpt = load_checkpoint(last_pt_path, device=device)
+        ckpt = load_checkpoint(last_pt_path, map_location="cpu")
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -418,17 +446,10 @@ def main() -> None:
         best_threshold = float(ckpt.get("best_threshold", 0.5))
         epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
 
-        # Restore RNG states
+        # Restore RNG states safely across CPU and CUDA
         if "rng_states" in ckpt and ckpt["rng_states"] is not None:
-            rng = ckpt["rng_states"]
-            if "python_rng" in rng and rng["python_rng"] is not None:
-                random.setstate(rng["python_rng"])
-            if "numpy_rng" in rng and rng["numpy_rng"] is not None:
-                np.random.set_state(rng["numpy_rng"])
-            if "torch_rng" in rng and rng["torch_rng"] is not None:
-                torch.set_rng_state(rng["torch_rng"])
-            if device.type == "cuda" and torch.cuda.is_available() and "cuda_rng" in rng and rng["cuda_rng"] is not None:
-                torch.cuda.set_rng_state_all(rng["cuda_rng"])
+            restore_rng_states(ckpt["rng_states"], device=device)
+
         print(
             f"Resumed from epoch {start_epoch - 1}. Current best val AUC: {best_val_auc:.4f} "
             f"(epoch {best_epoch}), early stopping counter: {epochs_no_improve}/{patience}"
