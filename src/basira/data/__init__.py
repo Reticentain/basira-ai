@@ -10,6 +10,7 @@ from basira.data.cache import (
     compute_cache_tag,
     validate_cache_manifest,
 )
+from basira.data.dataset import CachedFundusDataset
 from basira.data.dedup import compute_dhash_256, deduplicate_aptos
 from basira.data.loaders import (
     UNIFIED_COLUMNS,
@@ -63,4 +64,5 @@ __all__ = [
     "cache_path",
     "compute_cache_tag",
     "validate_cache_manifest",
+    "CachedFundusDataset",
 ]

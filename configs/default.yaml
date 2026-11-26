@@ -96,6 +96,8 @@ training:
   epochs: 20
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
+  scheduler: cosine             # cosine or plateau
+  early_stopping_patience: 5    # early stopping trigger on validation AUC
   use_class_weights: true       # compensate for grade imbalance
   use_amp: true                 # mixed-precision fp16 on GPU
   accumulation_steps: 1         # increase if GPU OOM
