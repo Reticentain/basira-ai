@@ -214,3 +214,77 @@ def quadratic_weighted_kappa(
     except Exception as exc:
         warnings.warn(f"quadratic_weighted_kappa failed with {exc}. Returning 0.0.", UserWarning, stacklevel=2)
         return 0.0
+
+
+def compute_ppv_npv(
+    y_true: np.ndarray | list,
+    y_prob: np.ndarray | list,
+    threshold: float,
+) -> tuple[float, float]:
+    """
+    Compute Positive Predictive Value (Precision) and Negative Predictive Value at fixed threshold.
+
+    Parameters
+    ----------
+    y_true : array-like of shape (N,)
+        Binary ground truth labels (0 or 1).
+    y_prob : array-like of shape (N,)
+        Predicted continuous probabilities in [0, 1].
+    threshold : float
+        Decision threshold.
+
+    Returns
+    -------
+    ppv : float
+        Positive Predictive Value (TP / (TP + FP)), or NaN if no positive predictions.
+    npv : float
+        Negative Predictive Value (TN / (TN + FN)), or NaN if no negative predictions.
+    """
+    y_t = np.asarray(y_true, dtype=int).ravel()
+    y_p = np.asarray(y_prob, dtype=float).ravel()
+    preds = (y_p >= threshold).astype(int)
+
+    tp = float(np.sum((y_t == 1) & (preds == 1)))
+    fp = float(np.sum((y_t == 0) & (preds == 1)))
+    tn = float(np.sum((y_t == 0) & (preds == 0)))
+    fn = float(np.sum((y_t == 1) & (preds == 0)))
+
+    ppv = (tp / (tp + fp)) if (tp + fp) > 0 else float("nan")
+    npv = (tn / (tn + fn)) if (tn + fn) > 0 else float("nan")
+    return ppv, npv
+
+
+def fraction_referable_per_grade(
+    y_grade: np.ndarray | list,
+    y_pred_referable: np.ndarray | list,
+    num_classes: int = 5,
+) -> dict[int, float]:
+    """
+    Compute the empirical fraction of images flagged as referable per true DR grade (0 to 4).
+
+    Parameters
+    ----------
+    y_grade : array-like of shape (N,)
+        True integer grades in 0..num_classes-1.
+    y_pred_referable : array-like of shape (N,)
+        Binary predicted referable flags (1 if predicted referable, else 0).
+    num_classes : int, default 5
+        Total number of grades (default 5 for DR grades 0-4).
+
+    Returns
+    -------
+    dict[int, float]
+        Mapping from grade (0 to 4) to fraction flagged referable (or NaN if no samples).
+    """
+    grades = np.asarray(y_grade, dtype=int).ravel()
+    preds = np.asarray(y_pred_referable, dtype=int).ravel()
+
+    result: dict[int, float] = {}
+    for g in range(num_classes):
+        mask = (grades == g)
+        count = int(np.sum(mask))
+        if count > 0:
+            result[g] = float(np.mean(preds[mask]))
+        else:
+            result[g] = float("nan")
+    return result
