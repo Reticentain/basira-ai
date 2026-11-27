@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -93,6 +93,54 @@ def load_config(override_path: Optional[str | Path] = None) -> DictConfig:
     if override_path is not None:
         extra = OmegaConf.load(override_path)
         cfg = OmegaConf.merge(cfg, extra)
+
+    return cfg
+
+
+def apply_overrides(cfg: DictConfig, items: list[str]) -> DictConfig:
+    """
+    Apply CLI key=value override strings to an OmegaConf DictConfig in-place.
+
+    Coerces:
+      - 'true' / 'false' (case-insensitive) -> bool
+      - integer strings -> int
+      - floating-point strings -> float
+      - all other values remain str
+
+    Parameters
+    ----------
+    cfg : DictConfig
+        Configuration object to modify.
+    items : list of str
+        List of strings formatted as 'key=value' or 'section.key=value'.
+
+    Returns
+    -------
+    DictConfig
+        The modified configuration object.
+    """
+    if not items:
+        return cfg
+
+    for item in items:
+        if "=" in item:
+            k, v = item.split("=", 1)
+            k_clean = k.strip()
+            v_clean = v.strip()
+            # Try type coercion (int, float, bool)
+            if v_clean.lower() == "true":
+                v_coerced: Any = True
+            elif v_clean.lower() == "false":
+                v_coerced = False
+            else:
+                try:
+                    v_coerced = int(v_clean)
+                except ValueError:
+                    try:
+                        v_coerced = float(v_clean)
+                    except ValueError:
+                        v_coerced = v_clean
+            OmegaConf.update(cfg, k_clean, v_coerced)
 
     return cfg
 

@@ -42,7 +42,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from basira.config import load_config
+from basira.config import apply_overrides, load_config
 from basira.data.cache import get_current_git_commit
 from basira.data.dataset import CachedFundusDataset
 from basira.data.loaders import read_split_csv
@@ -299,23 +299,8 @@ def main() -> None:
     cfg = load_config()
 
     # Apply CLI key=value overrides to config
-    for item in args.set:
-        if "=" in item:
-            k, v = item.split("=", 1)
-            # Try type coercion (int, float, bool)
-            if v.lower() == "true":
-                v_coerced: Any = True
-            elif v.lower() == "false":
-                v_coerced = False
-            else:
-                try:
-                    v_coerced = int(v)
-                except ValueError:
-                    try:
-                        v_coerced = float(v)
-                    except ValueError:
-                        v_coerced = v
-            OmegaConf.update(cfg, k.strip(), v_coerced)
+    if args.set:
+        apply_overrides(cfg, args.set)
 
     # Resolve seed
     seed = args.seed if args.seed is not None else int(cfg.seeds.global_seed)

@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from basira.config import apply_overrides, load_config
 from basira.eval.bootstrap import bootstrap_ci, compute_point_metrics
 from basira.eval.calibration import PlattScaler, compute_reliability_curve
 from basira.eval.metrics import (
@@ -27,7 +28,12 @@ from basira.eval.metrics import (
     fraction_referable_per_grade,
     sensitivity_at_specificity,
 )
-from scripts.evaluate import evaluate_dataset, generate_markdown_table
+from scripts.evaluate import (
+    build_eval_config,
+    evaluate_dataset,
+    generate_markdown_table,
+    parse_args,
+)
 
 
 class TestPatientBootstrap:
@@ -325,3 +331,69 @@ class TestNoTestSetThresholdTuning:
         # Oracle thresholds adapt to test distributions; deployable threshold remains invariant
         assert metrics_A["fixed_val_threshold"] != oracle_A or metrics_B["fixed_val_threshold"] != oracle_B
         assert "not deployable" in metrics_A["oracle (tuned on this set, not deployable)"]["description"]
+
+
+class TestCliAndConfig:
+    def test_evaluate_cli_parsing_and_config_overrides(self):
+        """
+        Verify CLI argument parsing and config overrides work without GPU or data,
+        catching signature errors like load_config(overrides=...).
+        """
+        args = parse_args([
+            "--run-name", "b0_smoke_eval",
+            "--set", "evaluation.bootstrap_n=5",
+            "training.batch_size=16",
+            "model.pretrained=false",
+            "evaluation.target_specificity=0.88",
+        ])
+        assert args.run_name == "b0_smoke_eval"
+        assert args.ckpt == "best.pt"
+        assert args.datasets == ["eyepacs_test", "aptos_deduped", "messidor2_test", "idrid_test"]
+
+        cfg = build_eval_config(args)
+        # Verify type coercion
+        assert cfg.evaluation.bootstrap_n == 5
+        assert isinstance(cfg.evaluation.bootstrap_n, int)
+        assert cfg.training.batch_size == 16
+        assert isinstance(cfg.training.batch_size, int)
+        assert cfg.model.pretrained is False
+        assert isinstance(cfg.model.pretrained, bool)
+        assert abs(cfg.evaluation.target_specificity - 0.88) < 1e-5
+        assert isinstance(cfg.evaluation.target_specificity, float)
+
+    def test_evaluate_cli_help(self):
+        """Ensure scripts/evaluate.py --help raises SystemExit(0)."""
+        with pytest.raises(SystemExit) as exc_info:
+            parse_args(["--help"])
+        assert exc_info.value.code == 0
+
+    def test_evaluate_cli_subprocess_help(self):
+        """Ensure `python scripts/evaluate.py --help` runs successfully via subprocess."""
+        import subprocess
+        import sys
+        ret = subprocess.run(
+            [sys.executable, "scripts/evaluate.py", "--help"],
+            capture_output=True,
+            text=True,
+        )
+        assert ret.returncode == 0
+        assert "usage:" in ret.stdout.lower() or "help" in ret.stdout.lower()
+
+    def test_apply_overrides_helper(self):
+        """Test apply_overrides directly with various types."""
+        cfg = load_config()
+        apply_overrides(cfg, [
+            "training.epochs=3",
+            "training.learning_rate=0.0005",
+            "image.apply_clahe=false",
+            "model.backbone=mobilenetv3",
+        ])
+        assert cfg.training.epochs == 3
+        assert isinstance(cfg.training.epochs, int)
+        assert cfg.training.learning_rate == 0.0005
+        assert isinstance(cfg.training.learning_rate, float)
+        assert cfg.image.apply_clahe is False
+        assert isinstance(cfg.image.apply_clahe, bool)
+        assert cfg.model.backbone == "mobilenetv3"
+        assert isinstance(cfg.model.backbone, str)
+

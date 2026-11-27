@@ -63,7 +63,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from basira.config import load_config
+from basira.config import apply_overrides, load_config
 from basira.data.cache import get_current_git_commit
 from basira.data.dataset import CachedFundusDataset
 from basira.data.loaders import read_split_csv
@@ -134,13 +134,18 @@ def build_and_load_model(
     ckpt = load_eval_checkpoint(ckpt_path, map_location="cpu")
 
     # Determine backbone name
+    backbone = None
     if backbone_override:
         backbone = backbone_override
-    elif isinstance(ckpt, dict) and "config" in ckpt and ckpt["config"].get("model", {}).get("backbone"):
-        backbone = ckpt["config"]["model"]["backbone"]
-    elif cfg is not None and hasattr(cfg, "model") and hasattr(cfg.model, "backbone"):
+    elif isinstance(ckpt, dict) and ckpt.get("config"):
+        cfg_in_ckpt = ckpt["config"]
+        if isinstance(cfg_in_ckpt, dict):
+            backbone = cfg_in_ckpt.get("model", {}).get("backbone")
+        elif hasattr(cfg_in_ckpt, "model"):
+            backbone = getattr(cfg_in_ckpt.model, "backbone", None)
+    if not backbone and cfg is not None and hasattr(cfg, "model") and hasattr(cfg.model, "backbone"):
         backbone = cfg.model.backbone
-    else:
+    if not backbone:
         backbone = "efficientnet_b0"
 
     timm_name = "mobilenetv3_large_100" if backbone in ("mobilenetv3", "mobilenetv3_large_100") else backbone
@@ -179,9 +184,9 @@ def run_inference(
             images = images.to(device, non_blocking=True)
             if use_amp:
                 with torch.amp.autocast("cuda"):
-                    out = model(images).squeeze(-1)
+                    out = model(images).view(-1)
             else:
-                out = model(images).squeeze(-1)
+                out = model(images).view(-1)
             all_logits.extend(out.cpu().tolist())
 
     logits = np.array(all_logits, dtype=np.float64)
@@ -305,7 +310,7 @@ def evaluate_dataset(
     # Per-image prediction DataFrame
     pred_df = pd.DataFrame({
         "image_id": df["image_id"].astype(str).values,
-        "source": df.get("source", dataset_name).astype(str).values,
+        "source": df["source"].astype(str).values if "source" in df.columns else np.array([dataset_name] * n_samples, dtype=object),
         "patient_id": df["patient_id"].values if "patient_id" in df.columns else [None] * n_samples,
         "grade": df["grade"].astype(int).values,
         "logit": logits,
@@ -567,7 +572,7 @@ def save_atomic_json(data: dict[str, Any], filepath: pathlib.Path) -> None:
     os.replace(tmp_path, filepath)
 
 
-def main() -> None:
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate trained Diabetic Retinopathy screening baseline.")
     parser.add_argument("--run-name", type=str, required=True, help="Run name (e.g. b0_referable_s42)")
     parser.add_argument("--ckpt", type=str, default="best.pt", help="Checkpoint filename or path (default: best.pt)")
@@ -586,13 +591,24 @@ def main() -> None:
         nargs="*",
         default=[],
         metavar="KEY=VALUE",
-        help="Config overrides, e.g. evaluation.bootstrap_n=500",
+        help="Config overrides as key=value pairs (e.g. evaluation.bootstrap_n=500)",
     )
-    args = parser.parse_args()
+    return parser.parse_args(argv)
 
-    # 1. Configuration
-    overrides = [f"++{kv}" for kv in args.set] if args.set else None
-    cfg = load_config(overrides=overrides)
+
+def build_eval_config(args: argparse.Namespace) -> DictConfig:
+    """Load base configuration and apply CLI key=value overrides."""
+    cfg = load_config()
+    if args.set:
+        apply_overrides(cfg, args.set)
+    return cfg
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = parse_args(argv)
+
+    # 1. Configuration with CLI overrides
+    cfg = build_eval_config(args)
 
     run_name = args.run_name.strip()
     target_spec = float(cfg.evaluation.target_specificity)
