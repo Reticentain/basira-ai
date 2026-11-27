@@ -288,3 +288,60 @@ def fraction_referable_per_grade(
         else:
             result[g] = float("nan")
     return result
+
+
+def wilson_score_interval(
+    successes: int,
+    total: int,
+    confidence: float = 0.95,
+) -> tuple[float, float]:
+    """
+    Compute the Wilson score confidence interval for a binomial proportion.
+
+    Handles edge cases (total == 0, successes == 0, successes == total)
+    gracefully, returning values strictly bounded in [0.0, 1.0].
+
+    Parameters
+    ----------
+    successes : int
+        Number of positive events (successes).
+    total : int
+        Total number of trials.
+    confidence : float, default 0.95
+        Confidence level (e.g. 0.95 for 95% CI).
+
+    Returns
+    -------
+    ci_lower : float
+        Lower bound in [0.0, 1.0], or NaN if total <= 0.
+    ci_upper : float
+        Upper bound in [0.0, 1.0], or NaN if total <= 0.
+    """
+    if total <= 0:
+        return float("nan"), float("nan")
+
+    k = max(0, min(int(successes), int(total)))
+    n = int(total)
+
+    alpha = 1.0 - float(confidence)
+    try:
+        from scipy.stats import norm
+        z = float(norm.ppf(1.0 - alpha / 2.0))
+    except Exception:
+        if abs(confidence - 0.95) < 1e-4:
+            z = 1.959963984540054
+        elif abs(confidence - 0.99) < 1e-4:
+            z = 2.5758293035489004
+        elif abs(confidence - 0.90) < 1e-4:
+            z = 1.6448536269514722
+        else:
+            z = 1.95996
+
+    p_hat = k / n
+    denominator = 1.0 + (z**2) / n
+    center = (p_hat + (z**2) / (2.0 * n)) / denominator
+    margin = (z / denominator) * np.sqrt((p_hat * (1.0 - p_hat) / n) + ((z**2) / (4.0 * (n**2))))
+
+    ci_lower = max(0.0, float(center - margin))
+    ci_upper = min(1.0, float(center + margin))
+    return ci_lower, ci_upper

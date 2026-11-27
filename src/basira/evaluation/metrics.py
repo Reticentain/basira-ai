@@ -11,6 +11,7 @@ from basira.eval.metrics import (
     fraction_referable_per_grade,
     quadratic_weighted_kappa,
     sensitivity_at_specificity,
+    wilson_score_interval,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "quadratic_weighted_kappa",
     "compute_ppv_npv",
     "fraction_referable_per_grade",
+    "wilson_score_interval",
 ]

@@ -524,8 +524,9 @@ def plot_training_curves(metrics_csv_path: pathlib.Path, output_path: pathlib.Pa
     ax = axes[0, 1]
     if "val_auc" in df_m.columns:
         ax.plot(epochs, df_m["val_auc"], label="Val AUC", color="#2ca02c", lw=2)
-    if "val_sens" in df_m.columns:
-        ax.plot(epochs, df_m["val_sens"], label="Val Sens @ 90% Spec", color="#d62728", lw=2)
+    sens_col = "val_sens_at_90spec" if "val_sens_at_90spec" in df_m.columns else ("val_sens" if "val_sens" in df_m.columns else None)
+    if sens_col is not None:
+        ax.plot(epochs, df_m[sens_col], label="Val Sens @ 90% Spec", color="#d62728", lw=2)
     ax.set_title("Validation AUC & Sensitivity", fontweight="bold")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Score")
