@@ -29,6 +29,7 @@ from scripts.gradcam import (
     GradCAM,
     mask_and_normalize_heatmap,
     overlay_heatmap,
+    select_target_layer,
 )
 from scripts.recalibrate import (
     run_aptos_recalibration,
@@ -200,6 +201,84 @@ class TestGradCAM:
         blended = overlay_heatmap(cached_img_rgb, norm_cam)
         assert blended.shape == (h, w, 3)
         assert 0.0 <= np.min(blended) <= np.max(blended) <= 1.0
+        # Background pixels outside the retina must remain strictly 0.0
+        assert np.all(blended[background_mask] == 0.0)
+
+    def test_overlay_heatmap_blends_whole_retina_including_zero_heatmap(self):
+        """
+        overlay_heatmap must blend the heatmap across the entire retina mask.
+        Pixels with heatmap == 0.0 must be tinted blue (in jet colormap),
+        and pixels outside the retina mask must remain untinted background (0.0).
+        """
+        h, w = 100, 100
+        y, x = np.ogrid[:h, :w]
+        center_y, center_x = 50, 50
+        radius = 40
+        circle_mask = ((x - center_x) ** 2 + (y - center_y) ** 2) <= (radius ** 2)
+
+        cached_img_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        cached_img_rgb[circle_mask] = 128  # gray retina
+
+        # Heatmap that is 0.0 everywhere
+        zero_heatmap = np.zeros((h, w), dtype=np.float32)
+        blended = overlay_heatmap(cached_img_rgb, zero_heatmap, alpha=0.5)
+
+        # 1. Background outside retina must be strictly 0.0
+        assert np.all(blended[~circle_mask] == 0.0)
+
+        # 2. Inside retina, heatmap 0 -> blue in jet (cmap(0.0) = [0, 0, ~0.5])
+        # So blue channel must be significantly higher than red channel inside retina
+        mean_r = np.mean(blended[circle_mask, 0])
+        mean_b = np.mean(blended[circle_mask, 2])
+        assert mean_b > mean_r, "Heatmap 0 must blend as blue, boosting blue channel over red"
+
+    def test_select_target_layer_default_and_stride16(self):
+        """Test layer selection for last conv and earlier stride-16 stage."""
+        class MultiStageNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # input: (1, 3, 256, 256)
+                self.stage1 = nn.Conv2d(3, 8, kernel_size=3, stride=2, padding=1)    # -> 128x128 (stride 2)
+                self.stage2 = nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1)   # -> 64x64 (stride 4)
+                self.stage3 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)  # -> 32x32 (stride 8)
+                self.stage4 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)  # -> 16x16 (stride 16)
+                self.stage5 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1) # -> 8x8 (stride 32)
+                self.pool = nn.AdaptiveAvgPool2d((1, 1))
+                self.classifier = nn.Linear(128, 1)
+
+            def forward(self, x):
+                x = F.relu(self.stage1(x))
+                x = F.relu(self.stage2(x))
+                x = F.relu(self.stage3(x))
+                x = F.relu(self.stage4(x))
+                x = F.relu(self.stage5(x))
+                x = self.pool(x)
+                x = torch.flatten(x, 1)
+                return self.classifier(x)
+
+        model = MultiStageNet()
+
+        # 1. Default / None -> last conv (stage5 at 8x8)
+        mod_default, name_default, res_default = select_target_layer(model, layer_spec=None)
+        assert mod_default is model.stage5
+        assert res_default == (8, 8)
+
+        # 2. stride16 -> stage4 at 16x16
+        mod_s16, name_s16, res_s16 = select_target_layer(model, layer_spec="stride16")
+        assert mod_s16 is model.stage4
+        assert res_s16 == (16, 16)
+
+        # 3. Explicit layer name
+        mod_s2, name_s2, res_s2 = select_target_layer(model, layer_spec="stage2")
+        assert mod_s2 is model.stage2
+        assert res_s2 == (64, 64)
+
+        # 4. GradCAM initialization with layer_name
+        cam_s16 = GradCAM(model, layer_name="stride16")
+        assert cam_s16.target_layer is model.stage4
+        assert cam_s16.map_resolution == (16, 16)
+        assert "stage4" in cam_s16.layer_name
+        cam_s16.remove_hooks()
 
 
 class TestRecalibration:

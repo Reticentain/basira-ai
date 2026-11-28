@@ -34,6 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from PIL import Image
+from scipy.ndimage import binary_fill_holes
 from scipy.stats import spearmanr
 import timm
 import torch
@@ -53,18 +54,157 @@ from basira.data.cache import cache_path
 from basira.data.dataset import resolve_cache_source
 
 
+def get_conv_layer_info(model: nn.Module, input_size: tuple[int, int] = (256, 256)) -> list[dict[str, Any]]:
+    """
+    Record name, module, and output spatial resolution (H, W) for all nn.Conv2d layers.
+    """
+    conv_info: list[dict[str, Any]] = []
+    hooks = []
+
+    def make_hook(name: str, mod: nn.Module):
+        def hook(m, inp, out):
+            if isinstance(out, torch.Tensor) and out.ndim == 4:
+                conv_info.append({
+                    "name": name,
+                    "module": mod,
+                    "shape": (out.shape[2], out.shape[3]),
+                })
+        return hook
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Conv2d):
+            h = mod.register_forward_hook(make_hook(name, mod))
+            hooks.append(h)
+
+    was_training = model.training
+    model.eval()
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+
+    dummy_input = torch.zeros(1, 3, input_size[0], input_size[1], device=device)
+    with torch.no_grad():
+        try:
+            _ = model(dummy_input)
+        except Exception:
+            pass
+
+    for h in hooks:
+        h.remove()
+
+    if was_training:
+        model.train()
+
+    return conv_info
+
+
+def select_target_layer(
+    model: nn.Module,
+    layer_spec: Optional[str] = None,
+    input_size: tuple[int, int] = (256, 256),
+) -> tuple[nn.Module, str, tuple[int, int]]:
+    """
+    Locate target convolutional module for Grad-CAM.
+
+    Parameters
+    ----------
+    model : nn.Module
+    layer_spec : str, optional
+        - None / 'last_conv' / 'default': Deepest conv layer (stride 32, typically 8x8).
+        - 'stride16' / 'stride-16': Deepest conv layer at stride 16 (finer 16x16 map).
+        - Explicit layer name (e.g. 'blocks.4' or 'conv_head').
+    input_size : tuple of int, default (256, 256)
+
+    Returns
+    -------
+    (target_module, layer_name, (map_h, map_w))
+    """
+    conv_info = get_conv_layer_info(model, input_size)
+
+    if not conv_info:
+        last_conv = GradCAM.find_last_conv_layer(model)
+        name = "last_conv"
+        for n, m in model.named_modules():
+            if m is last_conv:
+                name = n
+                break
+        return last_conv, name, (8, 8)
+
+    spec = (layer_spec or "last_conv").strip().lower()
+
+    # 1. Default to last conv layer
+    if spec in ("last_conv", "last", "default", "none"):
+        target = conv_info[-1]
+        return target["module"], target["name"], target["shape"]
+
+    # 2. Earlier stride-16 stage (e.g. 16x16 for 256x256 input)
+    if spec in ("stride16", "stride-16", "stride_16", "stage16", "earlier", "fine"):
+        target_res = (input_size[0] // 16, input_size[1] // 16)
+        matches = [c for c in conv_info if c["shape"] == target_res]
+        if matches:
+            target = matches[-1]
+            return target["module"], target["name"], target["shape"]
+        # Fallback to any layer with resolution >= 16x16 that is not the final conv
+        finer = [c for c in conv_info if c["shape"][0] >= 16 and c["shape"] != conv_info[-1]["shape"]]
+        if finer:
+            target = finer[-1]
+            return target["module"], target["name"], target["shape"]
+        target = conv_info[-1]
+        return target["module"], target["name"], target["shape"]
+
+    # 3. Explicit layer name matching
+    for c in reversed(conv_info):
+        if c["name"].lower() == spec:
+            return c["module"], c["name"], c["shape"]
+
+    for c in reversed(conv_info):
+        if spec in c["name"].lower():
+            return c["module"], c["name"], c["shape"]
+
+    for n, m in model.named_modules():
+        if n.lower() == spec or spec in n.lower():
+            sub_convs = [sub for sub in m.modules() if isinstance(sub, nn.Conv2d)]
+            if sub_convs:
+                last_sub = sub_convs[-1]
+                sub_name = n
+                for sub_n, sub_m in model.named_modules():
+                    if sub_m is last_sub:
+                        sub_name = sub_n
+                        break
+                sub_shape = next((c["shape"] for c in conv_info if c["module"] is last_sub), (16, 16))
+                return last_sub, sub_name, sub_shape
+            return m, n, (16, 16)
+
+    raise ValueError(
+        f"Layer '{layer_spec}' not found in model. Available conv layers:\n"
+        + "\n".join(f"  - {c['name']} (resolution: {c['shape'][0]}x{c['shape'][1]})" for c in conv_info)
+    )
+
+
 class GradCAM:
     """
     Gradient-weighted Class Activation Mapping (Grad-CAM).
 
-    Uses PyTorch forward and full backward hooks on the last convolutional module.
+    Uses PyTorch forward and full backward hooks on the target convolutional module.
     """
 
-    def __init__(self, model: nn.Module, target_layer: Optional[nn.Module] = None) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        target_layer: Optional[nn.Module] = None,
+        layer_name: Optional[str] = None,
+    ) -> None:
         self.model = model
         if target_layer is None:
-            target_layer = self.find_last_conv_layer(model)
-        self.target_layer = target_layer
+            mod, name, res = select_target_layer(model, layer_spec=layer_name)
+            self.target_layer = mod
+            self.layer_name = name
+            self.map_resolution: Optional[tuple[int, int]] = res
+        else:
+            self.target_layer = target_layer
+            self.layer_name = layer_name or getattr(target_layer, "_get_name", lambda: "target_conv")()
+            self.map_resolution = None
 
         self.activations: Optional[torch.Tensor] = None
         self.gradients: Optional[torch.Tensor] = None
@@ -85,6 +225,8 @@ class GradCAM:
 
     def _save_activations(self, module: nn.Module, inp: Any, out: torch.Tensor) -> None:
         self.activations = out
+        if isinstance(out, torch.Tensor) and out.ndim == 4:
+            self.map_resolution = (out.shape[2], out.shape[3])
 
     def _save_gradients(self, module: nn.Module, grad_in: Any, grad_out: tuple[torch.Tensor, ...]) -> None:
         self.gradients = grad_out[0]
@@ -134,6 +276,7 @@ class GradCAM:
 def mask_and_normalize_heatmap(
     raw_cam: np.ndarray,
     cached_image_rgb: np.ndarray,
+    fill_holes: bool = True,
 ) -> np.ndarray:
     """
     Mask Grad-CAM heatmap to retina foreground and min-max normalize within the retina.
@@ -147,14 +290,20 @@ def mask_and_normalize_heatmap(
         Raw upsampled Grad-CAM activations.
     cached_image_rgb : np.ndarray of shape (H, W, 3)
         Preprocessed fundus image.
+    fill_holes : bool, default True
+        Whether to fill interior holes in the retina mask.
 
     Returns
     -------
     masked_cam : np.ndarray of shape (H, W)
         Normalized and retina-masked heatmap.
     """
-    # Circular crop in Stage 1 leaves background strictly as zeros
     retina_mask = np.any(cached_image_rgb > 0, axis=-1)
+    if fill_holes and np.any(retina_mask):
+        try:
+            retina_mask = binary_fill_holes(retina_mask)
+        except Exception:
+            pass
 
     masked_cam = np.zeros_like(raw_cam, dtype=np.float32)
     if not np.any(retina_mask):
@@ -177,24 +326,61 @@ def overlay_heatmap(
     heatmap: np.ndarray,
     alpha: float = 0.45,
     cmap_name: str = "jet",
+    retina_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
-    Alpha-blend Grad-CAM heatmap onto RGB fundus image strictly within the retina.
+    Alpha-blend Grad-CAM heatmap onto RGB fundus image strictly over the WHOLE retina mask.
+
+    Pixels inside the retina mask (including zero-activation pixels where heatmap == 0)
+    are blended with the colormap (e.g. heatmap 0 -> blue in 'jet').
+    Pixels outside the retina mask remain untinted background (pure black, 0.0).
+
+    Parameters
+    ----------
+    image_rgb : np.ndarray of shape (H, W, 3)
+        Fundus image (uint8 [0, 255] or float [0.0, 1.0]).
+    heatmap : np.ndarray of shape (H, W)
+        Normalized heatmap in [0.0, 1.0].
+    alpha : float, default 0.45
+        Heatmap overlay opacity.
+    cmap_name : str, default "jet"
+        Matplotlib colormap name.
+    retina_mask : np.ndarray, optional
+        Binary mask (H, W) or (H, W, 1) indicating retina foreground.
+        If None, automatically computed from non-zero image pixels with hole filling.
+
+    Returns
+    -------
+    blended : np.ndarray of shape (H, W, 3)
+        Blended RGB image in [0.0, 1.0].
     """
     cmap = plt.get_cmap(cmap_name)
     colored_cam = cmap(heatmap)[:, :, :3]  # drop alpha channel -> (H, W, 3)
 
     img_f = image_rgb.astype(np.float32) / 255.0 if image_rgb.max() > 1.0 else image_rgb.astype(np.float32)
-    mask = (heatmap > 0)[:, :, np.newaxis]
 
+    if retina_mask is None:
+        mask_2d = np.any(image_rgb > 0, axis=-1)
+        if np.any(mask_2d):
+            try:
+                mask_2d = binary_fill_holes(mask_2d)
+            except Exception:
+                pass
+        mask = mask_2d[:, :, np.newaxis]
+    elif retina_mask.ndim == 2:
+        mask = retina_mask[:, :, np.newaxis]
+    else:
+        mask = retina_mask
+
+    # Blend over the ENTIRE retina mask (heatmap 0 -> blue in jet)
     blended = np.where(mask, (1.0 - alpha) * img_f + alpha * colored_cam, img_f)
     return np.clip(blended, 0.0, 1.0)
 
 
-def randomize_last_layers(model: nn.Module) -> None:
+def randomize_last_layers(model: nn.Module, target_layer: Optional[nn.Module] = None) -> None:
     """
-    Randomize weights of the classifier head and the final convolutional block
-    for the Adebayo et al. sanity check.
+    Randomize weights of the classifier head, the final convolutional block,
+    and optionally the target layer for the Adebayo et al. sanity check.
     """
     # 1. Randomize classifier
     if hasattr(model, "classifier") and isinstance(model.classifier, nn.Module):
@@ -221,6 +407,12 @@ def randomize_last_layers(model: nn.Module) -> None:
     for p in last_conv.parameters():
         if p.requires_grad:
             nn.init.normal_(p, std=0.02)
+
+    # 3. Randomize target layer if provided and distinct from last conv
+    if target_layer is not None and target_layer is not last_conv:
+        for p in target_layer.parameters():
+            if p.requires_grad:
+                nn.init.normal_(p, std=0.02)
 
 
 def compute_spearman_heatmap_correlation(
@@ -260,6 +452,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         nargs="+",
         default=["eyepacs_val", "eyepacs_test", "aptos_deduped", "messidor2_test", "idrid_test"],
         help="Datasets to process",
+    )
+    parser.add_argument(
+        "--layer",
+        type=str,
+        default=None,
+        help="Target convolutional layer or stage (e.g. 'last_conv', 'stride16', or explicit layer name). Default: last conv.",
     )
     parser.add_argument("--device", type=str, default=None, help="Device ('cuda' or 'cpu')")
     parser.add_argument("--seed", type=int, default=42, help="Seed for True Positive sampling")
@@ -349,7 +547,14 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     # 3. Model and Transform setup
     model = load_model_for_gradcam(ckpt_path, device, cfg)
-    gradcam = GradCAM(model)
+    gradcam = GradCAM(model, layer_name=args.layer)
+
+    res_str = (
+        f"{gradcam.map_resolution[0]}x{gradcam.map_resolution[1]}"
+        if gradcam.map_resolution
+        else "unknown"
+    )
+    print(f"Target Layer : {gradcam.layer_name} (Resolution: {res_str})")
 
     eval_transform = transforms.Compose([
         transforms.ToTensor(),
@@ -394,17 +599,16 @@ def main(argv: Optional[list[str]] = None) -> None:
             df_tp = df_tp_candidates.reset_index(drop=True)
 
         categories = [
-            ("True Positives (Referable Detected)", df_tp, "#2ca02c"),
-            ("False Negatives (Missed Referable)", df_fn, "#d62728"),
-            ("False Positives (Healthy Overcalled)", df_fp, "#ff7f0e"),
+            ("True Positives\n(Referable Detected)", df_tp, "#2ca02c"),
+            ("False Negatives\n(Missed Referable)", df_fn, "#d62728"),
+            ("False Positives\n(Healthy Overcalled)", df_fp, "#ff7f0e"),
         ]
 
-        fig, axes = plt.subplots(3, 8, figsize=(20, 8), dpi=300)
+        fig, axes = plt.subplots(3, 8, figsize=(20, 8.5), dpi=300)
 
         for row_idx, (cat_label, cat_df, cat_color) in enumerate(categories):
             for col_idx in range(8):
                 ax = axes[row_idx, col_idx]
-                ax.axis("off")
 
                 if col_idx < len(cat_df):
                     row = cat_df.iloc[col_idx]
@@ -415,45 +619,52 @@ def main(argv: Optional[list[str]] = None) -> None:
 
                     if not c_path.exists():
                         ax.text(0.5, 0.5, "Image\nMissing", ha="center", va="center", color="gray", fontsize=8)
-                        continue
+                    else:
+                        # Load preprocessed image
+                        img_pil = Image.open(c_path).convert("RGB")
+                        img_rgb = np.array(img_pil)
 
-                    # Load preprocessed image
-                    img_pil = Image.open(c_path).convert("RGB")
-                    img_rgb = np.array(img_pil)
+                        # Compute Grad-CAM
+                        inp_tensor = eval_transform(img_pil).unsqueeze(0).to(device)
+                        raw_cam = gradcam.generate(inp_tensor, class_idx=0)
+                        masked_cam = mask_and_normalize_heatmap(raw_cam, img_rgb)
+                        blended = overlay_heatmap(img_rgb, masked_cam, alpha=0.45)
 
-                    # Compute Grad-CAM
-                    inp_tensor = eval_transform(img_pil).unsqueeze(0).to(device)
-                    raw_cam = gradcam.generate(inp_tensor, class_idx=0)
-                    masked_cam = mask_and_normalize_heatmap(raw_cam, img_rgb)
-                    blended = overlay_heatmap(img_rgb, masked_cam, alpha=0.45)
-
-                    ax.imshow(blended)
-                    grade = int(row["grade"])
-                    prob = float(row["calibrated_prob"])
-                    ax.set_title(
-                        f"Grade {grade} | P={prob:.2f}\n{img_id[:10]}",
-                        fontsize=8,
-                        color=cat_color,
-                        fontweight="bold",
-                    )
+                        ax.imshow(blended)
+                        grade = int(row["grade"])
+                        prob = float(row["calibrated_prob"])
+                        ax.set_title(
+                            f"Grade {grade} | P={prob:.2f}\n{img_id}",
+                            fontsize=7.5,
+                            color=cat_color,
+                            fontweight="bold",
+                        )
                 else:
                     ax.text(0.5, 0.5, "N/A", ha="center", va="center", color="gray", fontsize=8)
 
-            axes[row_idx, 0].text(
-                -0.15,
-                0.5,
-                cat_label,
-                transform=axes[row_idx, 0].transAxes,
-                rotation=90,
-                va="center",
-                ha="center",
-                fontweight="bold",
-                fontsize=10,
-                color=cat_color,
-            )
+                if col_idx == 0:
+                    ax.axis("on")
+                    ax.set_ylabel(
+                        cat_label,
+                        fontsize=10,
+                        fontweight="bold",
+                        color=cat_color,
+                        labelpad=12,
+                        multialignment="center",
+                    )
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    for spine in ax.spines.values():
+                        spine.set_visible(False)
+                else:
+                    ax.axis("off")
 
-        fig.suptitle(f"Grad-CAM Visual Explanations — Dataset: {dname} (Threshold={threshold:.4f})", fontsize=14, fontweight="bold")
-        fig.tight_layout()
+        fig.suptitle(
+            f"Grad-CAM Visual Explanations — Dataset: {dname} (Threshold={threshold:.4f} | Layer: {gradcam.layer_name} [{res_str}])",
+            fontsize=13,
+            fontweight="bold",
+        )
+        fig.tight_layout(rect=[0.02, 0.02, 1.0, 0.94])
 
         out_grid_path = figures_dir / f"gradcam_{dname}.png"
         tmp_grid = figures_dir / f".tmp_{os.getpid()}_{out_grid_path.name}"
@@ -461,6 +672,22 @@ def main(argv: Optional[list[str]] = None) -> None:
         plt.close(fig)
         os.replace(tmp_grid, out_grid_path)
         print(f"  ✓ Saved Grad-CAM grid to: {out_grid_path}")
+
+    # Save overall Grad-CAM summary JSON
+    gradcam_payload = {
+        "run_name": run_name,
+        "target_layer": gradcam.layer_name,
+        "map_resolution": list(gradcam.map_resolution) if gradcam.map_resolution else None,
+        "operating_threshold": threshold,
+        "device": str(device),
+        "datasets": [d for d in args.datasets if (report_dir / f"{d}_predictions.csv").exists()],
+    }
+    gradcam_summary_path = figures_dir / "gradcam_summary.json"
+    tmp_gsum = figures_dir / f".tmp_{os.getpid()}_{gradcam_summary_path.name}"
+    with open(tmp_gsum, "w", encoding="utf-8") as f:
+        json.dump(gradcam_payload, f, indent=2)
+    os.replace(tmp_gsum, gradcam_summary_path)
+    print(f"  ✓ Saved Grad-CAM summary JSON to: {gradcam_summary_path}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # 5. Adebayo et al. Model Randomization Sanity Check
@@ -486,8 +713,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         # Build a fresh timm model instance and load checkpoint for randomization
         # (avoiding copy.deepcopy graph tensor issues)
         rand_model = load_model_for_gradcam(ckpt_path, device, cfg)
-        randomize_last_layers(rand_model)
-        rand_gradcam = GradCAM(rand_model)
+        rand_gradcam = GradCAM(rand_model, layer_name=args.layer)
+        randomize_last_layers(rand_model, target_layer=rand_gradcam.target_layer)
 
         for _, row in df_sample.iterrows():
             img_id = str(row["image_id"]).strip()
@@ -527,6 +754,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     # Save summary JSON
     sanity_payload = {
+        "target_layer": gradcam.layer_name,
+        "map_resolution": list(gradcam.map_resolution) if gradcam.map_resolution else None,
         "n_samples": len(spearman_scores),
         "mean_spearman_rho": mean_rho,
         "std_spearman_rho": std_rho,
@@ -549,7 +778,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         for i, (img_rgb, norm_orig, norm_rand, img_id) in enumerate(sample_viz):
             # 1. Fundus Image
             axes[i, 0].imshow(img_rgb)
-            axes[i, 0].set_title(f"Cached Fundus\n{img_id[:10]}", fontsize=9)
+            axes[i, 0].set_title(f"Cached Fundus\n{img_id}", fontsize=8)
             axes[i, 0].axis("off")
 
             # 2. Original Model Heatmap
@@ -568,7 +797,11 @@ def main(argv: Optional[list[str]] = None) -> None:
             axes[i, 3].set_title("Absolute Difference", fontsize=9)
             axes[i, 3].axis("off")
 
-        fig.suptitle(f"Adebayo et al. Sanity Check (Mean Spearman ρ = {mean_rho:.3f} ± {std_rho:.3f})", fontsize=12, fontweight="bold")
+        fig.suptitle(
+            f"Adebayo et al. Sanity Check — Layer: {gradcam.layer_name} [{res_str}] (Mean Spearman ρ = {mean_rho:.3f} ± {std_rho:.3f})",
+            fontsize=12,
+            fontweight="bold",
+        )
         fig.tight_layout()
         fig.savefig(tmp_sfig, dpi=300)
         plt.close(fig)
