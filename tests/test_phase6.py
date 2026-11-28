@@ -303,3 +303,130 @@ class TestCorruptions:
 
         assert np.array_equal(noisy1, noisy2), "Identical seed must produce identical corrupted arrays"
         assert not np.array_equal(noisy1, noisy_diff_seed), "Different seeds must produce distinct noise patterns"
+
+    def test_corrupted_output_uint8_and_bounded(self):
+        """Every corruption must return uint8 in [0, 255] with background zeroed."""
+        img = create_synthetic_fundus_image(h=64, w=64, radius=24, with_patterns=True)
+        bg_mask = ~np.any(img > 0, axis=-1)
+        for c_type in CORRUPTION_TYPES:
+            corrupted = apply_corruption(img, c_type, severity=5, seed=42, keep_background_zeroed=True)
+            assert corrupted.dtype == np.uint8, f"{c_type} returned dtype {corrupted.dtype}"
+            assert np.all(corrupted >= 0) and np.all(corrupted <= 255)
+            assert np.all(corrupted[bg_mask] == 0)
+
+
+class TestRobustnessNaNHandling:
+    def test_compute_robustness_cell_metrics_counts_and_worst_case(self):
+        """NaNs must be counted, excluded from valid metrics, and counted as wrong in worst-case."""
+        from scripts.robustness import compute_robustness_cell_metrics
+
+        # 4 positives (1 NaN), 4 negatives (1 NaN)
+        labels = np.array([1, 1, 1, 1, 0, 0, 0, 0], dtype=np.int64)
+        probs = np.array([0.9, 0.8, 0.7, np.nan, 0.1, 0.2, 0.3, np.nan], dtype=np.float64)
+
+        m = compute_robustness_cell_metrics(labels, probs, operating_threshold=0.5)
+
+        assert m["n_total"] == 8
+        assert m["n_valid"] == 6
+        assert m["n_nan"] == 2
+        # On valid 6 samples, predictions are perfect
+        assert m["auc"] == pytest.approx(1.0)
+        assert m["sensitivity"] == pytest.approx(1.0)
+        assert m["specificity"] == pytest.approx(1.0)
+        # In worst-case, 1 positive is FN (3/4=0.75) and 1 negative is FP (3/4=0.75)
+        assert m["worst_case_sensitivity"] == pytest.approx(0.75)
+        assert m["worst_case_specificity"] == pytest.approx(0.75)
+        assert m["worst_case_auc"] < m["auc"]
+
+    def test_compute_robustness_cell_metrics_all_nan(self):
+        """All-NaN predictions must not crash and must yield 0.0 worst-case sens/spec."""
+        from scripts.robustness import compute_robustness_cell_metrics
+
+        labels = np.array([1, 1, 0, 0], dtype=np.int64)
+        probs = np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float64)
+
+        m = compute_robustness_cell_metrics(labels, probs, operating_threshold=0.5)
+
+        assert m["n_total"] == 4
+        assert m["n_valid"] == 0
+        assert m["n_nan"] == 4
+        assert math.isnan(m["auc"])
+        assert m["worst_case_sensitivity"] == pytest.approx(0.0)
+        assert m["worst_case_specificity"] == pytest.approx(0.0)
+
+    def test_evaluate_corrupted_dataset_with_nan_model_output(self, tmp_path, monkeypatch):
+        """End-to-end test where a model produces NaN logits on a corrupted input."""
+        from PIL import Image as PILImage
+        from types import SimpleNamespace
+        from basira.eval.calibration import PlattScaler
+        from scripts.robustness import evaluate_corrupted_dataset, generate_robustness_markdown
+
+        cache_dir = tmp_path / "cache"
+        (cache_dir / "eyepacs_test").mkdir(parents=True)
+
+        # Create 6 synthetic images: 3 grade 0, 3 grade 2
+        rows = []
+        for i in range(6):
+            img_id = f"img_{i}"
+            img = create_synthetic_fundus_image(h=64, w=64, radius=24, with_patterns=True)
+            PILImage.fromarray(img).save(cache_dir / "eyepacs_test" / f"{img_id}.png")
+            rows.append({"image_id": img_id, "source": "eyepacs_test", "grade": 2 if i >= 3 else 0})
+
+        df_eval = pd.DataFrame(rows)
+
+        monkeypatch.setattr(
+            "scripts.robustness.cache_path",
+            lambda src, img_id, cfg: cache_dir / src / f"{img_id}.png",
+        )
+        monkeypatch.setattr("scripts.robustness.resolve_cache_source", lambda s: s)
+
+        class _NanTriggeringModel(torch.nn.Module):
+            """Outputs finite logits on normal images, NaN on brightness_up severity 5 (brightest)."""
+
+            def __init__(self):
+                super().__init__()
+                self.dummy = torch.nn.Parameter(torch.zeros(1))
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                assert x.dtype == torch.float32
+                assert torch.isfinite(x).all()
+                # Trigger NaN on the first two samples when batch mean is elevated (brightness_up)
+                batch_means = x.mean(dim=(1, 2, 3))
+                out = torch.where(
+                    batch_means > batch_means.min() + 0.05,
+                    torch.tensor(float("nan"), dtype=torch.float32, device=x.device),
+                    torch.tensor(0.5, dtype=torch.float32, device=x.device),
+                )
+                # Ensure at least one NaN when brightness_up shifts mean above clean baseline (~ -0.5)
+                if float(x.mean()) > -0.25:
+                    out[0] = float("nan")
+                return out
+
+        cfg = SimpleNamespace(
+            image=SimpleNamespace(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        )
+        scaler = PlattScaler(slope=1.0, intercept=0.0)
+        scaler.is_fitted = True
+
+        res = evaluate_corrupted_dataset(
+            model=_NanTriggeringModel(),
+            df_eval=df_eval,
+            dataset_name="eyepacs_test",
+            scaler=scaler,
+            operating_threshold=0.5,
+            gate=None,
+            cfg=cfg,
+            device=torch.device("cpu"),
+            corruptions=["brightness_up"],
+            severities=[5],
+            seed=42,
+            batch_size=6,
+        )
+
+        rec = res["corruptions"]["brightness_up"][0]
+        assert rec["n_nan"] >= 1
+        assert rec["n_valid"] + rec["n_nan"] == 6
+
+        md = generate_robustness_markdown("test_run", 0.5, {"eyepacs_test": res})
+        assert "Cells with Non-Finite (NaN) Predictions" in md
+        assert "brightness_up" in md

@@ -172,12 +172,25 @@ class CorruptedFundusDataset(Dataset):
         else:
             corrupted = img_rgb
 
+        # Clip to valid [0, 255] uint8 range and keep background strictly zero
+        if not np.issubdtype(corrupted.dtype, np.integer):
+            corrupted = np.nan_to_num(corrupted, nan=0.0, posinf=255.0, neginf=0.0)
+        corrupted = np.clip(corrupted, 0, 255).astype(np.uint8)
+        if self.corruption_type and self.severity > 0:
+            bg_mask = ~np.any(img_rgb > 0, axis=-1)
+            corrupted[bg_mask] = 0
+
         # Stage 2: Tensor conversion and ImageNet normalization
         tensor = to_tensor_and_normalize(
             corrupted,
             mean=tuple(self.cfg.image.mean),
             std=tuple(self.cfg.image.std),
         )
+        if not torch.isfinite(tensor).all():
+            raise AssertionError(
+                f"Non-finite values (NaN/Inf) in input tensor for '{img_id}' "
+                f"(corruption={self.corruption_type}, severity={self.severity})."
+            )
         return tensor, label, img_id
 
 
@@ -186,25 +199,85 @@ def run_model_inference(
     loader: DataLoader,
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Execute model inference over DataLoader returning logits and labels."""
+    """Execute model inference in fp32 (no autocast) returning logits and labels."""
+    model.float()
     model.eval()
     all_logits = []
     all_labels = []
 
-    use_amp = (device.type == "cuda")
-
     with torch.no_grad():
         for tensors, labels, _ in loader:
-            tensors = tensors.to(device, non_blocking=True)
-            if use_amp:
-                with torch.amp.autocast("cuda"):
-                    out = model(tensors).view(-1)
-            else:
-                out = model(tensors).view(-1)
+            tensors = tensors.to(device, dtype=torch.float32, non_blocking=True)
+            if not torch.isfinite(tensors).all():
+                raise AssertionError("Non-finite values (NaN/Inf) in model input batch.")
+            out = model(tensors).view(-1)
             all_logits.extend(out.cpu().tolist())
             all_labels.extend(labels.tolist())
 
     return np.array(all_logits, dtype=np.float64), np.array(all_labels, dtype=np.int64)
+
+
+def compute_robustness_cell_metrics(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    operating_threshold: float,
+) -> dict[str, Any]:
+    """Compute metrics on valid predictions and worst-case metrics counting NaNs as wrong."""
+    labels_arr = np.asarray(labels, dtype=np.int64).ravel()
+    probs_arr = np.asarray(probs, dtype=np.float64).ravel()
+
+    valid_mask = np.isfinite(probs_arr)
+    n_total = int(len(labels_arr))
+    n_valid = int(np.sum(valid_mask))
+    n_nan = n_total - n_valid
+
+    if n_valid > 0:
+        valid_labels = labels_arr[valid_mask]
+        valid_probs = probs_arr[valid_mask]
+        auc = float(compute_auc(valid_labels, valid_probs))
+        valid_preds = (valid_probs >= operating_threshold).astype(int)
+        tp = int(np.sum((valid_labels == 1) & (valid_preds == 1)))
+        fp = int(np.sum((valid_labels == 0) & (valid_preds == 1)))
+        tn = int(np.sum((valid_labels == 0) & (valid_preds == 0)))
+        fn = int(np.sum((valid_labels == 1) & (valid_preds == 0)))
+        sensitivity = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+        specificity = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+    else:
+        auc = float("nan")
+        sensitivity = float("nan")
+        specificity = float("nan")
+
+    # Worst-case: count every NaN/non-finite prediction as wrong
+    if n_total > 0:
+        worst_probs = np.where(valid_mask, probs_arr, np.where(labels_arr == 1, 0.0, 1.0))
+        worst_auc = float(compute_auc(labels_arr, worst_probs))
+        valid_or_wrong_preds = np.where(
+            valid_mask,
+            (np.where(valid_mask, probs_arr, 0.0) >= operating_threshold).astype(int),
+            1 - labels_arr,
+        )
+        w_tp = int(np.sum((labels_arr == 1) & (valid_or_wrong_preds == 1)))
+        w_fp = int(np.sum((labels_arr == 0) & (valid_or_wrong_preds == 1)))
+        w_tn = int(np.sum((labels_arr == 0) & (valid_or_wrong_preds == 0)))
+        w_fn = int(np.sum((labels_arr == 1) & (valid_or_wrong_preds == 0)))
+        worst_sensitivity = float(w_tp / (w_tp + w_fn)) if (w_tp + w_fn) > 0 else 0.0
+        worst_specificity = float(w_tn / (w_tn + w_fp)) if (w_tn + w_fp) > 0 else 0.0
+    else:
+        worst_auc = float("nan")
+        worst_sensitivity = float("nan")
+        worst_specificity = float("nan")
+
+    return {
+        "auc": auc,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "n_total": n_total,
+        "n_valid": n_valid,
+        "n_nan": n_nan,
+        "worst_case_auc": worst_auc,
+        "worst_case_sensitivity": worst_sensitivity,
+        "worst_case_specificity": worst_specificity,
+    }
 
 
 def evaluate_corrupted_dataset(
@@ -239,20 +312,10 @@ def evaluate_corrupted_dataset(
     clean_logits, clean_labels = run_model_inference(model, clean_loader, device)
     clean_probs = scaler.predict_proba(clean_logits)
 
-    clean_auc = float(compute_auc(clean_labels, clean_probs))
-    clean_preds = (clean_probs >= operating_threshold).astype(int)
-    tp = int(np.sum((clean_labels == 1) & (clean_preds == 1)))
-    fp = int(np.sum((clean_labels == 0) & (clean_preds == 1)))
-    tn = int(np.sum((clean_labels == 0) & (clean_preds == 0)))
-    fn = int(np.sum((clean_labels == 1) & (clean_preds == 0)))
-    clean_sens = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-    clean_spec = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
-
-    dataset_results["clean_baseline"] = {
-        "auc": clean_auc,
-        "sensitivity": clean_sens,
-        "specificity": clean_spec,
-    }
+    clean_metrics = compute_robustness_cell_metrics(clean_labels, clean_probs, operating_threshold)
+    clean_auc = clean_metrics["auc"]
+    clean_worst_auc = clean_metrics["worst_case_auc"]
+    dataset_results["clean_baseline"] = clean_metrics
 
     # 2. Corruptions Evaluation
     for c_type in corruptions:
@@ -266,15 +329,16 @@ def evaluate_corrupted_dataset(
             corr_logits, corr_labels = run_model_inference(model, corr_loader, device)
             corr_probs = scaler.predict_proba(corr_logits)
 
-            auc_sev = float(compute_auc(corr_labels, corr_probs))
-            preds_sev = (corr_probs >= operating_threshold).astype(int)
-            tp_s = int(np.sum((corr_labels == 1) & (preds_sev == 1)))
-            fp_s = int(np.sum((corr_labels == 0) & (preds_sev == 1)))
-            tn_s = int(np.sum((corr_labels == 0) & (preds_sev == 0)))
-            fn_s = int(np.sum((corr_labels == 1) & (preds_sev == 0)))
-
-            sens_sev = float(tp_s / (tp_s + fn_s)) if (tp_s + fn_s) > 0 else 0.0
-            spec_sev = float(tn_s / (tn_s + fp_s)) if (tn_s + fp_s) > 0 else 0.0
+            cell_metrics = compute_robustness_cell_metrics(
+                corr_labels, corr_probs, operating_threshold
+            )
+            auc_sev = cell_metrics["auc"]
+            worst_auc_sev = cell_metrics["worst_case_auc"]
+            if cell_metrics["n_nan"] > 0:
+                print(
+                    f"  [WARN] {dataset_name} | {c_type} sev={sev}: "
+                    f"{cell_metrics['n_nan']}/{cell_metrics['n_total']} NaN predictions."
+                )
 
             # Quality Gate Rejection Rate check on corrupted sample
             rej_rate_10 = float("nan")
@@ -302,10 +366,9 @@ def evaluate_corrupted_dataset(
 
             sev_record = {
                 "severity": sev,
-                "auc": auc_sev,
-                "sensitivity": sens_sev,
-                "specificity": spec_sev,
+                **cell_metrics,
                 "auc_drop": float(clean_auc - auc_sev),
+                "worst_case_auc_drop": float(clean_worst_auc - worst_auc_sev),
                 "gate_rejection_rate_10pct": rej_rate_10,
             }
             dataset_results["corruptions"][c_type].append(sev_record)
@@ -392,21 +455,51 @@ def generate_robustness_markdown(
         "",
         "## 1. Clean Baselines vs. Severe Corruptions (Severity Level 5)",
         "",
-        "| Dataset | Corruption Type | Clean AUC | Corrupted AUC (Sev 5) | AUC Drop (Δ) | Sens @ 90% Spec | Gate Rejection Rate (%) |",
-        "|:---|:---|:---:|:---:|:---:|:---:|:---:|",
+        "| Dataset | Corruption Type | Clean AUC | Corrupted AUC (Sev 5) | Worst-Case AUC (Sev 5) | NaN Count | AUC Drop (Δ) | Sens @ 90% Spec | Gate Rejection Rate (%) |",
+        "|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
     ]
+
+    nan_cells: list[tuple[str, str, int, int, int, float, float]] = []
 
     for dname, d_res in robustness_results.items():
         clean_auc = d_res["clean_baseline"]["auc"]
         for c_type, records in d_res["corruptions"].items():
             if not records:
                 continue
+            for rec in records:
+                if rec.get("n_nan", 0) > 0:
+                    nan_cells.append(
+                        (
+                            dname,
+                            c_type,
+                            rec["severity"],
+                            rec["n_nan"],
+                            rec["n_total"],
+                            rec.get("auc", float("nan")),
+                            rec.get("worst_case_auc", float("nan")),
+                        )
+                    )
             r5 = records[-1]  # severity 5
             c_name = c_type.replace("_", " ").title()
             rej_str = f"{r5['gate_rejection_rate_10pct'] * 100:.1f}%" if not np.isnan(r5['gate_rejection_rate_10pct']) else "N/A"
+            worst_auc_val = r5.get("worst_case_auc", r5["auc"])
+            nan_cnt = r5.get("n_nan", 0)
             lines.append(
-                f"| `{dname}` | {c_name} | `{clean_auc:.4f}` | `{r5['auc']:.4f}` | **`-{r5['auc_drop']:.4f}`** | "
-                f"`{r5['sensitivity']:.4f}` | **`{rej_str}`** |"
+                f"| `{dname}` | {c_name} | `{clean_auc:.4f}` | `{r5['auc']:.4f}` | `{worst_auc_val:.4f}` | "
+                f"`{nan_cnt}` | **`-{r5['auc_drop']:.4f}`** | `{r5['sensitivity']:.4f}` | **`{rej_str}`** |"
+            )
+
+    if nan_cells:
+        lines.extend([
+            "",
+            "## 1b. Cells with Non-Finite (NaN) Predictions",
+            "",
+            "| Dataset | Corruption | Severity | NaN / Total | Valid AUC | Worst-Case AUC |",
+            "|:---|:---|:---:|:---:|:---:|:---:|",
+        ])
+        for dname, c_type, sev, n_nan, n_tot, v_auc, w_auc in nan_cells:
+            lines.append(
+                f"| `{dname}` | {c_type} | {sev} | {n_nan} / {n_tot} | `{v_auc:.4f}` | `{w_auc:.4f}` |"
             )
 
     lines.extend([

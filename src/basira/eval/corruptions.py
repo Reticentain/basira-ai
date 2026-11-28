@@ -192,8 +192,12 @@ def apply_corruption(
             f"Unknown corruption type: '{corruption_type}'. Supported: {CORRUPTION_TYPES}"
         )
 
+    if not np.issubdtype(corrupted.dtype, np.integer):
+        corrupted = np.nan_to_num(corrupted, nan=0.0, posinf=255.0, neginf=0.0)
+    corrupted = np.clip(corrupted, 0, 255).astype(np.uint8)
+
     if keep_background_zeroed:
         retina_mask = np.any(img_rgb > 0, axis=-1, keepdims=True)
-        corrupted = np.where(retina_mask, corrupted, 0)
+        corrupted = np.where(retina_mask, corrupted, np.uint8(0))
 
     return corrupted
