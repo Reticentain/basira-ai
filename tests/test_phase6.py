@@ -390,15 +390,10 @@ class TestRobustnessNaNHandling:
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 assert x.dtype == torch.float32
                 assert torch.isfinite(x).all()
-                # Trigger NaN on the first two samples when batch mean is elevated (brightness_up)
-                batch_means = x.mean(dim=(1, 2, 3))
-                out = torch.where(
-                    batch_means > batch_means.min() + 0.05,
-                    torch.tensor(float("nan"), dtype=torch.float32, device=x.device),
-                    torch.tensor(0.5, dtype=torch.float32, device=x.device),
-                )
-                # Ensure at least one NaN when brightness_up shifts mean above clean baseline (~ -0.5)
-                if float(x.mean()) > -0.25:
+                out = torch.full((x.shape[0],), 0.5, dtype=torch.float32, device=x.device)
+                # Clean synthetic image max normalized value is ~1.992 (240/255);
+                # brightness_up sev 5 saturates pixels to 255 (~2.249 on R channel).
+                if float(x.max()) > 2.1:
                     out[0] = float("nan")
                 return out
 
@@ -430,3 +425,83 @@ class TestRobustnessNaNHandling:
         md = generate_robustness_markdown("test_run", 0.5, {"eyepacs_test": res})
         assert "Cells with Non-Finite (NaN) Predictions" in md
         assert "brightness_up" in md
+
+
+class TestQualityReportText:
+    def test_neutral_gate_no_substantially_and_report_elements(self):
+        """Generated report must not use 'substantially' or 'improves' when |delta AUC| < 0.01."""
+        from scripts.quality_analysis import generate_quality_markdown_report
+
+        gate = QualityGate()
+        coverage_results = {
+            "eyepacs_test": {
+                "all_images": {
+                    "n_evaluated": 1000,
+                    "auc": 0.9100,
+                    "sensitivity": 0.8500,
+                    "specificity": 0.9000,
+                },
+                "tiers": {
+                    "reject_5%": {
+                        "coverage_pct": 95.0,
+                        "rejection_rate_pct": 5.0,
+                        "n_evaluated": 950,
+                        "auc": 0.9120,
+                        "sensitivity": 0.8520,
+                        "specificity": 0.9010,
+                        "fn_filtered_out": 2,
+                        "fp_filtered_out": 3,
+                    },
+                    "reject_10%": {
+                        "coverage_pct": 89.5,
+                        "rejection_rate_pct": 10.5,
+                        "n_evaluated": 895,
+                        "auc": 0.9140,
+                        "sensitivity": 0.8530,
+                        "specificity": 0.9020,
+                        "fn_filtered_out": 4,
+                        "fp_filtered_out": 5,
+                    },
+                },
+            }
+        }
+        quartile_results = {
+            "eyepacs_test": [
+                {
+                    "quartile": "Q1 (Lowest Quality)",
+                    "n": 250,
+                    "prevalence": 0.25,
+                    "auc": 0.8800,
+                    "sensitivity": 0.8200,
+                    "specificity": 0.8700,
+                }
+            ]
+        }
+        enrichment_results = {
+            "eyepacs_test": {
+                "overall_lq_rate": 0.10,
+                "fn": {"count": 12, "lq_count": 3, "lq_rate": 0.25},
+                "fp": {"count": 45, "lq_count": 5, "lq_rate": 0.1111},
+                "fn_enrichment_ratio": 2.5,
+                "fp_enrichment_ratio": 1.11,
+            }
+        }
+
+        md = generate_quality_markdown_report(
+            run_name="test_run",
+            operating_threshold=0.2785,
+            gate=gate,
+            quartile_results=quartile_results,
+            enrichment_results=enrichment_results,
+            coverage_results=coverage_results,
+        )
+
+        assert "substantially" not in md.lower()
+        assert "improves" not in md.lower()
+        assert "neutral" in md.lower()
+        assert "Sensitivity @ frozen threshold" in md
+        assert "gate fitted for 5% rejection on val" in md
+        assert "gate fitted for 10% rejection on val" in md
+        assert "confounded by severity mix" in md
+        assert "n_FN" in md and "n_FP" in md
+        assert "Small Error Counts (n < 30)" in md

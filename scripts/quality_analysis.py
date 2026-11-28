@@ -224,9 +224,9 @@ def plot_coverage_vs_performance(
     ax_auc.grid(True, linestyle=":", alpha=0.6)
     ax_auc.legend(fontsize=8, loc="lower left")
 
-    ax_sens.set_title("Sensitivity @ 90% Spec vs. Coverage", fontweight="bold", fontsize=11)
+    ax_sens.set_title("Sensitivity @ frozen threshold vs. Coverage", fontweight="bold", fontsize=11)
     ax_sens.set_xlabel("Coverage (% Images Accepted)", fontsize=10)
-    ax_sens.set_ylabel("Sensitivity @ Frozen Threshold", fontsize=10)
+    ax_sens.set_ylabel("Sensitivity @ frozen threshold", fontsize=10)
     ax_sens.grid(True, linestyle=":", alpha=0.6)
     ax_sens.legend(fontsize=8, loc="lower left")
 
@@ -346,6 +346,12 @@ def compute_enrichment_analysis(
     }
 
 
+def _format_tier_label(tier_key: str) -> str:
+    """Format gate tier key (e.g. 'reject_5%') as a descriptive label."""
+    pct = tier_key.replace("reject_", "")
+    return f"gate fitted for {pct} rejection on val"
+
+
 def generate_quality_markdown_report(
     run_name: str,
     operating_threshold: float,
@@ -368,7 +374,7 @@ def generate_quality_markdown_report(
         "",
         "## 1. Quality Gate Coverage vs. Diagnostic Performance",
         "",
-        "| Dataset | Rejection Tier | Coverage (%) | Rejection Rate (%) | Evaluated N | AUC | Sensitivity @ 90% Spec | Specificity | Errors Filtered (FN / FP) |",
+        "| Dataset | Rejection Tier | Coverage (%) | Rejection Rate (%) | Evaluated N | AUC | Sensitivity @ frozen threshold | Specificity | Errors Filtered (FN / FP) |",
         "|:---|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
     ]
 
@@ -379,8 +385,9 @@ def generate_quality_markdown_report(
             f"`{base['auc']:.4f}` | `{base['sensitivity']:.4f}` | `{base['specificity']:.4f}` | Baseline (0 / 0) |"
         )
         for tier_key, tdata in cov_data["tiers"].items():
+            tier_label = _format_tier_label(tier_key)
             lines.append(
-                f"| `{dname}` | {tier_key} Gate | `{tdata['coverage_pct']:.1f}%` | `{tdata['rejection_rate_pct']:.1f}%` | {tdata['n_evaluated']:,} | "
+                f"| `{dname}` | {tier_label} | `{tdata['coverage_pct']:.1f}%` | `{tdata['rejection_rate_pct']:.1f}%` | {tdata['n_evaluated']:,} | "
                 f"`{tdata['auc']:.4f}` | `{tdata['sensitivity']:.4f}` | `{tdata['specificity']:.4f}` | {tdata['fn_filtered_out']} FN / {tdata['fp_filtered_out']} FP |"
             )
 
@@ -390,7 +397,11 @@ def generate_quality_markdown_report(
         "",
         "## 2. Diagnostic Performance by Quality Quartiles",
         "",
-        "| Dataset | Quality Quartile | N | Prevalence (%) | AUC | Sensitivity @ Frozen Thresh | Specificity |",
+        "> [!NOTE]",
+        "> **Within-Dataset Quartiles & Severity Confounding:** Quality quartiles are computed within each dataset independently. "
+        "Prevalence differs strongly across quartiles (see the Prevalence (%) column), so quartile AUCs are confounded by severity mix.",
+        "",
+        "| Dataset | Quality Quartile | N | Prevalence (%) | AUC | Sensitivity @ frozen threshold | Specificity |",
         "|:---|:---|:---:|:---:|:---:|:---:|:---:|",
     ])
 
@@ -408,32 +419,77 @@ def generate_quality_markdown_report(
         "## 3. Low-Quality Enrichment Among Diagnostic Errors",
         "",
         "> [!NOTE]",
-        "> **Enrichment Ratio:** Ratio of low-quality rate in error subset (FN or FP) vs. overall dataset baseline. "
-        "An enrichment ratio > 1.0 indicates that poor image quality directly precipitates diagnostic failure.",
+        "> **Enrichment Ratio:** Ratio of low-quality rate in error subset (FN or FP) vs. overall dataset baseline.",
         "",
-        "| Dataset | Baseline LQ Rate (%) | LQ Rate in FN (%) | FN Enrichment Ratio | LQ Rate in FP (%) | FP Enrichment Ratio |",
-        "|:---|:---:|:---:|:---:|:---:|:---:|",
+        "| Dataset | Baseline LQ Rate (%) | n_FN | LQ Rate in FN (%) | FN Enrichment Ratio | n_FP | LQ Rate in FP (%) | FP Enrichment Ratio |",
+        "|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|",
     ])
 
+    small_count_warnings: list[str] = []
     for dname, enr in enrichment_results.items():
         base_rate = enr["overall_lq_rate"] * 100
+        n_fn = int(enr["fn"]["count"])
+        n_fp = int(enr["fp"]["count"])
         fn_rate = enr["fn"]["lq_rate"] * 100
         fp_rate = enr["fp"]["lq_rate"] * 100
         fn_enr = enr["fn_enrichment_ratio"]
         fp_enr = enr["fp_enrichment_ratio"]
         lines.append(
-            f"| `{dname}` | `{base_rate:.1f}%` | `{fn_rate:.1f}%` | **`{fn_enr:.2f}x`** | `{fp_rate:.1f}%` | **`{fp_enr:.2f}x`** |"
+            f"| `{dname}` | `{base_rate:.1f}%` | {n_fn:,} | `{fn_rate:.1f}%` | **`{fn_enr:.2f}x`** | {n_fp:,} | `{fp_rate:.1f}%` | **`{fp_enr:.2f}x`** |"
         )
+        low_groups = []
+        if n_fn < 30:
+            low_groups.append(f"n_FN={n_fn}")
+        if n_fp < 30:
+            low_groups.append(f"n_FP={n_fp}")
+        if low_groups:
+            small_count_warnings.append(f"`{dname}` ({', '.join(low_groups)})")
+
+    if small_count_warnings:
+        lines.extend([
+            "",
+            "> [!WARNING]",
+            f"> **Small Error Counts (n < 30):** {', '.join(small_count_warnings)}. "
+            "Enrichment ratios computed from fewer than 30 errors have high sampling variance and should be interpreted with caution.",
+        ])
 
     lines.extend([
         "",
         "---",
         "",
-        "## 4. Methodology & Findings",
+        "## 4. Data-Driven Gate Summary",
         "- **Quality Metrics:** Evaluated sharpness (green-channel Laplacian variance on interior retina), contrast (luminance standard deviation), brightness, retina fill fraction, and R/G color ratio.",
-        "- **Error Concentration:** Low-quality images are substantially over-represented among False Negatives and False Positives across all external clinical cohorts.",
-        "- **Clinical Safety Gate:** Deploying the 10% rejection gate eliminates high-uncertainty images, substantially boosting test AUC and Sensitivity with acceptable coverage impact.",
     ])
+
+    for dname, cov_data in coverage_results.items():
+        base = cov_data["all_images"]
+        base_auc = base["auc"]
+        base_sens = base["sensitivity"]
+        tier_summaries = []
+        all_neutral = True
+        for tier_key, tdata in cov_data["tiers"].items():
+            d_auc = tdata["auc"] - base_auc
+            d_sens = tdata["sensitivity"] - base_sens
+            tier_label = _format_tier_label(tier_key)
+            if np.isnan(d_auc):
+                effect = "AUC undefined"
+            elif d_auc > 0.01:
+                effect = "improves AUC"
+                all_neutral = False
+            elif d_auc < -0.01:
+                effect = "reduces AUC"
+                all_neutral = False
+            else:
+                effect = "neutral on AUC"
+            tier_summaries.append(
+                f"{tier_label} (rej {tdata['rejection_rate_pct']:.1f}%): ΔAUC={d_auc:+.4f}, ΔSens={d_sens:+.4f} [{effect}]"
+            )
+
+        if all_neutral:
+            overall_note = "Gate is neutral on AUC (|ΔAUC| <= 0.01 across all tiers)."
+        else:
+            overall_note = "Gate produces |ΔAUC| > 0.01 on at least one tier."
+        lines.append(f"- **`{dname}`:** {overall_note} " + "; ".join(tier_summaries) + ".")
 
     return "\n".join(lines) + "\n"
 
