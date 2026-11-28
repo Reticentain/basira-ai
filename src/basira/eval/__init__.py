@@ -6,11 +6,20 @@ Evaluation metrics, calibration, and bootstrap confidence intervals for Basira A
 
 from basira.eval.bootstrap import bootstrap_ci, compute_point_metrics
 from basira.eval.calibration import PlattScaler, compute_reliability_curve
+from basira.eval.corruptions import (
+    CORRUPTION_TYPES,
+    SEVERITY_LEVELS,
+    apply_corruption,
+)
 from basira.eval.inference import (
     build_and_load_model,
     find_split_file,
     load_eval_checkpoint,
     run_inference,
+)
+from basira.eval.quality import (
+    QualityGate,
+    compute_image_quality_metrics,
 )
 from basira.eval.metrics import (
     compute_auc,
@@ -38,4 +47,9 @@ __all__ = [
     "load_eval_checkpoint",
     "build_and_load_model",
     "run_inference",
+    "compute_image_quality_metrics",
+    "QualityGate",
+    "apply_corruption",
+    "CORRUPTION_TYPES",
+    "SEVERITY_LEVELS",
 ]
