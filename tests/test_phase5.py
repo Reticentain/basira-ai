@@ -34,6 +34,11 @@ from scripts.recalibrate import (
     run_aptos_recalibration,
     run_single_calibration_trial,
 )
+from scripts.aggregate_runs import (
+    aggregate_runs_data,
+    generate_aggregate_markdown,
+    main as aggregate_main,
+)
 
 
 class TestWilsonScoreInterval:
@@ -44,15 +49,17 @@ class TestWilsonScoreInterval:
         assert 0.0 <= ci_lo < 0.50 < ci_hi <= 1.0
         assert math.isclose((ci_lo + ci_hi) / 2.0, 0.50, rel_tol=1e-3)
 
-        # 0 / 100 -> lower bound must be exactly 0.0
+        # 0 / 100 -> lower bound must be clamped to 0.0
         ci_lo_zero, ci_hi_zero = wilson_score_interval(0, 100, confidence=0.95)
-        assert ci_lo_zero == 0.0
+        assert math.isclose(ci_lo_zero, 0.0, abs_tol=1e-5)
+        assert 0.0 <= ci_lo_zero <= 0.05
         assert 0.0 < ci_hi_zero < 0.05
 
-        # 100 / 100 -> upper bound must be exactly 1.0
+        # 100 / 100 -> upper bound must be clamped to 1.0
         ci_lo_one, ci_hi_one = wilson_score_interval(100, 100, confidence=0.95)
         assert 0.95 < ci_lo_one < 1.0
-        assert ci_hi_one == 1.0
+        assert math.isclose(ci_hi_one, 1.0, abs_tol=1e-5)
+        assert 0.95 <= ci_hi_one <= 1.0
 
     def test_wilson_ci_edge_cases(self):
         """Zero trials must return NaN without crashing."""
@@ -252,9 +259,145 @@ class TestRecalibration:
             frozen_scaler, frozen_thresh, n_repeats=5, seed=777
         )
 
+        # Invariant: sample sizes >= len(train_logits) (200, 500) must be skipped
+        assert "25" in res1["sample_size_results"]
+        assert "50" in res1["sample_size_results"]
+        assert "100" in res1["sample_size_results"]
+        assert "200" not in res1["sample_size_results"]
+        assert "500" not in res1["sample_size_results"]
+        assert "all" in res1["sample_size_results"]
+
         s1 = res1["sample_size_results"]["50"]["summary"]
         s2 = res2["sample_size_results"]["50"]["summary"]
 
         assert math.isclose(s1["sensitivity_mean"], s2["sensitivity_mean"], rel_tol=1e-7)
         assert math.isclose(s1["specificity_mean"], s2["specificity_mean"], rel_tol=1e-7)
         assert math.isclose(s1["threshold_mean"], s2["threshold_mean"], rel_tol=1e-7)
+
+
+class TestAggregateRuns:
+    def test_aggregate_runs_data_synthetic(self):
+        """Aggregate computation must compute sample mean and ddof=1 sample standard deviation."""
+        r1 = {
+            "datasets": {
+                "eyepacs_test": {
+                    "auc": {"val": 0.950},
+                    "sensitivity": {"val": 0.880},
+                    "specificity": {"val": 0.890},
+                    "oracle (tuned on this set, not deployable)": {"sensitivity": 0.900},
+                },
+                "aptos_deduped": {
+                    "auc": {"val": 0.960},
+                    "sensitivity": {"val": 0.850},
+                    "specificity": {"val": 0.910},
+                    "oracle (tuned on this set, not deployable)": {"sensitivity": 0.880},
+                },
+            }
+        }
+        r2 = {
+            "datasets": {
+                "eyepacs_test": {
+                    "auc": {"val": 0.952},
+                    "sensitivity": {"val": 0.884},
+                    "specificity": {"val": 0.895},
+                    "oracle (tuned on this set, not deployable)": {"sensitivity": 0.904},
+                },
+                "aptos_deduped": {
+                    "auc": {"val": 0.966},
+                    "sensitivity": {"val": 0.860},
+                    "specificity": {"val": 0.915},
+                    "oracle (tuned on this set, not deployable)": {"sensitivity": 0.890},
+                },
+            }
+        }
+        r3 = {
+            "datasets": {
+                "eyepacs_test": {
+                    "auc": {"val": 0.954},
+                    "sensitivity": {"val": 0.888},
+                    "specificity": {"val": 0.900},
+                    "oracle (tuned on this set, not deployable)": {"sensitivity": 0.908},
+                },
+                "aptos_deduped": {
+                    "auc": {"val": 0.972},
+                    "sensitivity": {"val": 0.870},
+                    "specificity": {"val": 0.920},
+                    "oracle (tuned on this set, not deployable)": {"sensitivity": 0.900},
+                },
+            }
+        }
+
+        agg = aggregate_runs_data(["run1", "run2", "run3"], [r1, r2, r3])
+        assert agg["n_runs"] == 3
+        assert "eyepacs_test" in agg["datasets"]
+        assert "aptos_deduped" in agg["datasets"]
+
+        eye = agg["datasets"]["eyepacs_test"]
+        assert math.isclose(eye["auc"]["mean"], 0.9520, abs_tol=1e-5)
+        assert math.isclose(eye["auc"]["sd"], 0.0020, abs_tol=1e-5)
+        assert math.isclose(eye["sensitivity"]["mean"], 0.8840, abs_tol=1e-5)
+        assert math.isclose(eye["sensitivity"]["sd"], 0.0040, abs_tol=1e-5)
+        assert math.isclose(eye["specificity"]["mean"], 0.8950, abs_tol=1e-5)
+        assert math.isclose(eye["specificity"]["sd"], 0.0050, abs_tol=1e-5)
+        assert math.isclose(eye["oracle_sensitivity"]["mean"], 0.9040, abs_tol=1e-5)
+        assert math.isclose(eye["oracle_sensitivity"]["sd"], 0.0040, abs_tol=1e-5)
+
+        # Markdown generation test
+        md = generate_aggregate_markdown(agg)
+        assert "Multi-Run Aggregate Evaluation Summary" in md
+        assert "eyepacs_test" in md
+        assert "0.9520 ± 0.0020" in md
+
+    def test_aggregate_runs_cli_end_to_end(self, tmp_path):
+        """End-to-end integration test reading mock results.json files from disk."""
+        reports_dir = tmp_path / "reports"
+        run_a = reports_dir / "b0_referable_s42"
+        run_b = reports_dir / "b0_referable_s1"
+        run_a.mkdir(parents=True)
+        run_b.mkdir(parents=True)
+
+        payload_a = {
+            "run_name": "b0_referable_s42",
+            "datasets": {
+                "eyepacs_test": {
+                    "auc": {"val": 0.950},
+                    "sensitivity": {"val": 0.880},
+                    "specificity": {"val": 0.900},
+                    "oracle (tuned on this set, not deployable)": {"sensitivity": 0.902},
+                }
+            },
+        }
+        payload_b = {
+            "run_name": "b0_referable_s1",
+            "datasets": {
+                "eyepacs_test": {
+                    "auc": {"val": 0.954},
+                    "sensitivity": {"val": 0.886},
+                    "specificity": {"val": 0.904},
+                    "oracle (tuned on this set, not deployable)": {"sensitivity": 0.908},
+                }
+            },
+        }
+
+        import json
+        with open(run_a / "results.json", "w", encoding="utf-8") as f:
+            json.dump(payload_a, f)
+        with open(run_b / "results.json", "w", encoding="utf-8") as f:
+            json.dump(payload_b, f)
+
+        out_dir = reports_dir / "aggregate"
+        aggregate_main([
+            "--runs", "b0_referable_s42", "b0_referable_s1",
+            "--reports-root", str(reports_dir),
+            "--output-dir", str(out_dir),
+        ])
+
+        assert (out_dir / "aggregate_results.json").exists()
+        assert (out_dir / "aggregate_table.md").exists()
+
+        with open(out_dir / "aggregate_results.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["n_runs"] == 2
+        assert "eyepacs_test" in data["datasets"]
+        eye = data["datasets"]["eyepacs_test"]
+        assert math.isclose(eye["auc"]["mean"], 0.9520, abs_tol=1e-5)

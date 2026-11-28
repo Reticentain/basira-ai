@@ -6,6 +6,12 @@ Evaluation metrics, calibration, and bootstrap confidence intervals for Basira A
 
 from basira.eval.bootstrap import bootstrap_ci, compute_point_metrics
 from basira.eval.calibration import PlattScaler, compute_reliability_curve
+from basira.eval.inference import (
+    build_and_load_model,
+    find_split_file,
+    load_eval_checkpoint,
+    run_inference,
+)
 from basira.eval.metrics import (
     compute_auc,
     compute_ppv_npv,
@@ -28,4 +34,8 @@ __all__ = [
     "compute_reliability_curve",
     "bootstrap_ci",
     "compute_point_metrics",
+    "find_split_file",
+    "load_eval_checkpoint",
+    "build_and_load_model",
+    "run_inference",
 ]

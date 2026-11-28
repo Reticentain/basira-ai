@@ -342,6 +342,13 @@ def wilson_score_interval(
     center = (p_hat + (z**2) / (2.0 * n)) / denominator
     margin = (z / denominator) * np.sqrt((p_hat * (1.0 - p_hat) / n) + ((z**2) / (4.0 * (n**2))))
 
-    ci_lower = max(0.0, float(center - margin))
-    ci_upper = min(1.0, float(center + margin))
+    ci_lower = max(0.0, min(1.0, float(center - margin)))
+    ci_upper = max(0.0, min(1.0, float(center + margin)))
+
+    # Clamp bounds strictly to 0.0 and 1.0
+    if k == 0:
+        ci_lower = 0.0
+    if k == n:
+        ci_upper = 1.0
+
     return ci_lower, ci_upper

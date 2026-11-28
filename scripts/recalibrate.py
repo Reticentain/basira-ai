@@ -45,8 +45,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-# Ensure src/ is on sys.path
+# Ensure repo root and src/ are on sys.path
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 if str(_REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "src"))
 
@@ -54,8 +56,8 @@ from basira.config import apply_overrides, load_config
 from basira.data.dataset import CachedFundusDataset
 from basira.data.loaders import read_split_csv
 from basira.eval.calibration import PlattScaler
+from basira.eval.inference import find_split_file, load_eval_checkpoint, run_inference
 from basira.eval.metrics import compute_auc, sensitivity_at_specificity
-from scripts.evaluate import find_split_file, load_eval_checkpoint, run_inference
 
 
 SAMPLE_SIZES = [25, 50, 100, 200, 500, "all"]
@@ -219,6 +221,10 @@ def run_aptos_recalibration(
             }
         else:
             n_int = int(n_val)
+            # If n is greater than or equal to total available samples, skip it
+            if n_int >= total_train:
+                continue
+
             for r in range(n_repeats):
                 r_seed = seed + r * 1000 + n_int
                 # Stratified sample of size n_int from train
@@ -268,6 +274,8 @@ def run_aptos_recalibration(
 
     return {
         "dataset": "APTOS 2019",
+        "n_train": len(train_labels),
+        "n_test": len(test_labels),
         "frozen_baseline": frozen_perf,
         "oracle_upper_bound": oracle_perf,
         "sample_size_results": results_by_n,
@@ -333,7 +341,8 @@ def run_idrid_recalibration(
 
     return {
         "dataset": "IDRiD",
-        "note": "Small sample size (total N=516; 258 calibration / 258 evaluation). Higher variance is expected.",
+        "n_total": len(idrid_labels),
+        "note": f"Small sample size (total N={len(idrid_labels)}; {summary['n_calibration']} calibration / {summary['n_evaluation']} evaluation). Higher variance is expected.",
         "frozen_baseline": frozen_perf,
         "oracle_upper_bound": oracle_perf,
         "50_50_split_summary": summary,
@@ -347,6 +356,12 @@ def generate_recalibration_markdown(
     idrid_res: dict[str, Any],
 ) -> str:
     """Generate Markdown report summarizing local recalibration results."""
+    n_aptos_test = aptos_res.get("n_test", 524)
+    n_idrid_total = idrid_res.get("n_total", 516)
+    idrid_summary = idrid_res.get("50_50_split_summary", {})
+    n_idrid_cal = idrid_summary.get("n_calibration", 258)
+    n_idrid_eval = idrid_summary.get("n_evaluation", 258)
+
     lines = [
         f"# Basira AI — Local Recalibration Report: `{run_name}`",
         "",
@@ -359,7 +374,7 @@ def generate_recalibration_markdown(
         "## 1. APTOS 2019 Local Recalibration",
         "",
         "Platt scaling parameters and operating threshold (target specificity ≥ 0.90) were refit on $n$ labelled images",
-        "drawn from `aptos_train.csv` (20 seeded stratified repetitions) and evaluated on `aptos_test.csv` (3,487 images).",
+        f"drawn from `aptos_train.csv` (20 seeded stratified repetitions) and evaluated on `aptos_test.csv` ({n_aptos_test:,} images).",
         "",
         "| Sample Size $n$ | Sensitivity (Mean ± SD) | Specificity (Mean ± SD) | AUC (Mean ± SD) | Selected Threshold |",
         "|:---|:---:|:---:|:---:|:---:|",
@@ -373,6 +388,8 @@ def generate_recalibration_markdown(
 
     # Sample size rows
     for n_key in SAMPLE_SIZES:
+        if str(n_key) not in aptos_res.get("sample_size_results", {}):
+            continue
         s = aptos_res["sample_size_results"][str(n_key)]["summary"]
         n_lbl = s["n_label"]
         sens = f"{s['sensitivity_mean']:.4f} ± {s['sensitivity_sd']:.4f}"
@@ -394,7 +411,7 @@ def generate_recalibration_markdown(
         "## 2. IDRiD Local Recalibration (Repeated 50/50 Splits)",
         "",
         "> [!NOTE]",
-        "> **Small Sample Limitation:** IDRiD comprises 516 total images (258 calibration / 258 test per split). "
+        f"> **Small Sample Limitation:** IDRiD comprises {n_idrid_total:,} total images ({n_idrid_cal:,} calibration / {n_idrid_eval:,} test per split). "
         "Higher variance across repetitions reflects sample size constraints in rare clinical disease categories.",
         "",
         "| Configuration | Sensitivity (Mean ± SD) | Specificity (Mean ± SD) | AUC (Mean ± SD) | Selected Threshold |",
@@ -442,7 +459,21 @@ def plot_recalibration_curves(
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), dpi=300)
 
     # Extract numeric sample sizes (exclude 'all' from x-axis plotting, plot as vertical marker or max)
-    sample_sizes = [25, 50, 100, 200, 500]
+    sample_sizes = [
+        n for n in [25, 50, 100, 200, 500]
+        if str(n) in aptos_res.get("sample_size_results", {})
+    ]
+    if not sample_sizes:
+        fig, ax = plt.subplots(figsize=(6, 4), dpi=300)
+        ax.text(0.5, 0.5, "No sub-sample sizes evaluated", ha="center", va="center")
+        ax.axis("off")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = output_path.parent / f".tmp_{os.getpid()}_{output_path.name}"
+        fig.savefig(tmp_path, dpi=300)
+        plt.close(fig)
+        os.replace(tmp_path, output_path)
+        return
+
     sens_means = [aptos_res["sample_size_results"][str(n)]["summary"]["sensitivity_mean"] for n in sample_sizes]
     sens_sds = [aptos_res["sample_size_results"][str(n)]["summary"]["sensitivity_sd"] for n in sample_sizes]
     spec_means = [aptos_res["sample_size_results"][str(n)]["summary"]["specificity_mean"] for n in sample_sizes]
@@ -594,8 +625,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     print("  ✓ APTOS Results Summary:")
     print(f"    - Frozen Baseline   : Sens={aptos_results['frozen_baseline']['sensitivity']:.4f}, Spec={aptos_results['frozen_baseline']['specificity']:.4f}, AUC={aptos_results['frozen_baseline']['auc']:.4f}")
     for n_key in SAMPLE_SIZES:
-        s = aptos_results["sample_size_results"][str(n_key)]["summary"]
-        print(f"    - n={s['n_label']:<4}              : Sens={s['sensitivity_mean']:.4f}±{s['sensitivity_sd']:.4f}, Spec={s['specificity_mean']:.4f}±{s['specificity_sd']:.4f}, AUC={s['auc_mean']:.4f}")
+        if str(n_key) in aptos_results.get("sample_size_results", {}):
+            s = aptos_results["sample_size_results"][str(n_key)]["summary"]
+            print(f"    - n={s['n_label']:<4}              : Sens={s['sensitivity_mean']:.4f}±{s['sensitivity_sd']:.4f}, Spec={s['specificity_mean']:.4f}±{s['specificity_sd']:.4f}, AUC={s['auc_mean']:.4f}")
     print(f"    - Oracle Upper Bound: Sens={aptos_results['oracle_upper_bound']['sensitivity']:.4f}, Spec={aptos_results['oracle_upper_bound']['specificity']:.4f}")
 
     # ─────────────────────────────────────────────────────────────────────────

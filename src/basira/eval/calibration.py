@@ -17,6 +17,7 @@ import pathlib
 from typing import Any, Optional
 
 import numpy as np
+from scipy.special import expit
 from sklearn.linear_model import LogisticRegression
 
 
@@ -85,13 +86,7 @@ class PlattScaler:
         """
         z = np.asarray(logits, dtype=np.float64)
         scaled = self.slope * z + self.intercept
-        # Numerically stable sigmoid
-        prob = np.where(
-            scaled >= 0,
-            1.0 / (1.0 + np.exp(-scaled)),
-            np.exp(scaled) / (1.0 + np.exp(scaled)),
-        )
-        return prob
+        return expit(scaled)
 
     def to_dict(self) -> dict[str, Any]:
         """Export parameters as a serializable dictionary."""

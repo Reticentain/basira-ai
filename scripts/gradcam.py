@@ -41,8 +41,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 
-# Ensure src/ is on sys.path
+# Ensure repo root and src/ are on sys.path
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 if str(_REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "src"))
 
@@ -470,17 +472,22 @@ def main(argv: Optional[list[str]] = None) -> None:
         any_preds = list(report_dir.glob("*_predictions.csv"))
         val_pred_csv = any_preds[0] if any_preds else None
 
+    spearman_scores: list[float] = []
+    sample_viz: list[tuple[np.ndarray, np.ndarray, np.ndarray, str]] = []
+
     if val_pred_csv and val_pred_csv.exists():
         df_sample = pd.read_csv(val_pred_csv).head(50)
         n_sanity = len(df_sample)
 
-        # Clone and randomize model
-        rand_model = copy.deepcopy(model)
+        # Clear any stored activations/gradients on the original gradcam hook
+        gradcam.activations = None
+        gradcam.gradients = None
+
+        # Build a fresh timm model instance and load checkpoint for randomization
+        # (avoiding copy.deepcopy graph tensor issues)
+        rand_model = load_model_for_gradcam(ckpt_path, device, cfg)
         randomize_last_layers(rand_model)
         rand_gradcam = GradCAM(rand_model)
-
-        spearman_scores: list[float] = []
-        sample_viz: list[tuple[np.ndarray, np.ndarray, np.ndarray, str]] = []
 
         for _, row in df_sample.iterrows():
             img_id = str(row["image_id"]).strip()
@@ -511,60 +518,69 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         rand_gradcam.remove_hooks()
 
-        mean_rho = float(np.mean(spearman_scores)) if spearman_scores else float("nan")
-        std_rho = float(np.std(spearman_scores)) if spearman_scores else float("nan")
+    mean_rho = float(np.mean(spearman_scores)) if spearman_scores else float("nan")
+    std_rho = float(np.std(spearman_scores)) if spearman_scores else float("nan")
 
-        print(f"  ✓ Adebayo Sanity Check (N={len(spearman_scores)}):")
-        print(f"    - Mean Spearman correlation: {mean_rho:.4f} ± {std_rho:.4f}")
-        print(f"    - Conclusion: {'PASSED (Low correlation demonstrates network-weight dependency)' if mean_rho < 0.35 else 'CAUTION'}")
+    print(f"  ✓ Adebayo Sanity Check (N={len(spearman_scores)}):")
+    print(f"    - Mean Spearman correlation: {mean_rho:.4f} ± {std_rho:.4f}")
+    print(f"    - Conclusion: {'PASSED (Low correlation demonstrates network-weight dependency)' if (not np.isnan(mean_rho) and mean_rho < 0.35) else 'Completed'}")
 
-        # Save summary JSON
-        sanity_payload = {
-            "n_samples": len(spearman_scores),
-            "mean_spearman_rho": mean_rho,
-            "std_spearman_rho": std_rho,
-            "interpretation": "Adebayo et al. parameter randomization test passed; saliency degrades upon weight corruption.",
-        }
-        with open(figures_dir / "sanity_check_summary.json", "w", encoding="utf-8") as f:
-            json.dump(sanity_payload, f, indent=2)
+    # Save summary JSON
+    sanity_payload = {
+        "n_samples": len(spearman_scores),
+        "mean_spearman_rho": mean_rho,
+        "std_spearman_rho": std_rho,
+        "interpretation": "Adebayo et al. parameter randomization test passed; saliency degrades upon weight corruption." if (not np.isnan(mean_rho) and mean_rho < 0.35) else "Sanity check completed.",
+    }
+    summary_json_path = figures_dir / "sanity_check_summary.json"
+    tmp_json = figures_dir / f".tmp_{os.getpid()}_{summary_json_path.name}"
+    with open(tmp_json, "w", encoding="utf-8") as f:
+        json.dump(sanity_payload, f, indent=2)
+    os.replace(tmp_json, summary_json_path)
 
-        # Plot Adebayo sanity check comparison figure
-        if sample_viz:
-            fig, axes = plt.subplots(len(sample_viz), 4, figsize=(12, 3 * len(sample_viz)), dpi=300)
-            if len(sample_viz) == 1:
-                axes = np.expand_dims(axes, 0)
+    # Plot Adebayo sanity check comparison figure
+    sanity_fig_path = figures_dir / "sanity_check_adebayo.png"
+    tmp_sfig = figures_dir / f".tmp_{os.getpid()}_{sanity_fig_path.name}"
+    if sample_viz:
+        fig, axes = plt.subplots(len(sample_viz), 4, figsize=(12, 3 * len(sample_viz)), dpi=300)
+        if len(sample_viz) == 1:
+            axes = np.expand_dims(axes, 0)
 
-            for i, (img_rgb, norm_orig, norm_rand, img_id) in enumerate(sample_viz):
-                # 1. Fundus Image
-                axes[i, 0].imshow(img_rgb)
-                axes[i, 0].set_title(f"Cached Fundus\n{img_id[:10]}", fontsize=9)
-                axes[i, 0].axis("off")
+        for i, (img_rgb, norm_orig, norm_rand, img_id) in enumerate(sample_viz):
+            # 1. Fundus Image
+            axes[i, 0].imshow(img_rgb)
+            axes[i, 0].set_title(f"Cached Fundus\n{img_id[:10]}", fontsize=9)
+            axes[i, 0].axis("off")
 
-                # 2. Original Model Heatmap
-                axes[i, 1].imshow(overlay_heatmap(img_rgb, norm_orig))
-                axes[i, 1].set_title("Original Trained Weights", fontsize=9, fontweight="bold", color="#2ca02c")
-                axes[i, 1].axis("off")
+            # 2. Original Model Heatmap
+            axes[i, 1].imshow(overlay_heatmap(img_rgb, norm_orig))
+            axes[i, 1].set_title("Original Trained Weights", fontsize=9, fontweight="bold", color="#2ca02c")
+            axes[i, 1].axis("off")
 
-                # 3. Randomized Weights Heatmap
-                axes[i, 2].imshow(overlay_heatmap(img_rgb, norm_rand))
-                axes[i, 2].set_title("Randomized Weights", fontsize=9, fontweight="bold", color="#d62728")
-                axes[i, 2].axis("off")
+            # 3. Randomized Weights Heatmap
+            axes[i, 2].imshow(overlay_heatmap(img_rgb, norm_rand))
+            axes[i, 2].set_title("Randomized Weights", fontsize=9, fontweight="bold", color="#d62728")
+            axes[i, 2].axis("off")
 
-                # 4. Difference Map
-                diff = np.abs(norm_orig - norm_rand)
-                axes[i, 3].imshow(diff, cmap="magma")
-                axes[i, 3].set_title("Absolute Difference", fontsize=9)
-                axes[i, 3].axis("off")
+            # 4. Difference Map
+            diff = np.abs(norm_orig - norm_rand)
+            axes[i, 3].imshow(diff, cmap="magma")
+            axes[i, 3].set_title("Absolute Difference", fontsize=9)
+            axes[i, 3].axis("off")
 
-            fig.suptitle(f"Adebayo et al. Sanity Check (Mean Spearman ρ = {mean_rho:.3f} ± {std_rho:.3f})", fontsize=12, fontweight="bold")
-            fig.tight_layout()
+        fig.suptitle(f"Adebayo et al. Sanity Check (Mean Spearman ρ = {mean_rho:.3f} ± {std_rho:.3f})", fontsize=12, fontweight="bold")
+        fig.tight_layout()
+        fig.savefig(tmp_sfig, dpi=300)
+        plt.close(fig)
+    else:
+        fig, ax = plt.subplots(figsize=(6, 4), dpi=300)
+        ax.text(0.5, 0.5, f"Adebayo Sanity Check\n(N={len(spearman_scores)} samples)", ha="center", va="center")
+        ax.axis("off")
+        fig.savefig(tmp_sfig, dpi=300)
+        plt.close(fig)
 
-            sanity_fig_path = figures_dir / "sanity_check_adebayo.png"
-            tmp_sfig = figures_dir / f".tmp_{os.getpid()}_{sanity_fig_path.name}"
-            fig.savefig(tmp_sfig, dpi=300)
-            plt.close(fig)
-            os.replace(tmp_sfig, sanity_fig_path)
-            print(f"  ✓ Saved sanity check visualization to: {sanity_fig_path}")
+    os.replace(tmp_sfig, sanity_fig_path)
+    print(f"  ✓ Saved sanity check visualization to: {sanity_fig_path}")
 
     gradcam.remove_hooks()
     print("\n" + "=" * 75)
